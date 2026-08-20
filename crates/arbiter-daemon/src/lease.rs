@@ -164,6 +164,24 @@ mod tests {
 
     use super::DaemonLease;
 
+    #[cfg(windows)]
+    fn has_single_protected_full_control_ace(sddl: &str) -> bool {
+        let dacl = sddl.strip_prefix("D:").unwrap_or(sddl);
+        let first_ace = dacl.find('(').unwrap_or(dacl.len());
+        let (control, aces) = dacl.split_at(first_ace);
+        let control = control.replace("AI", "");
+        if control != "P" {
+            return false;
+        }
+        let Some(ace) = aces.strip_prefix("(A;;FA;;;") else {
+            return false;
+        };
+        let Some((principal, remainder)) = ace.split_once(')') else {
+            return false;
+        };
+        !principal.is_empty() && !remainder.contains('(')
+    }
+
     #[test]
     fn only_one_process_lease_can_own_a_database() {
         let temporary = tempdir().unwrap();
@@ -204,8 +222,10 @@ mod tests {
 
         for path in [&database, &lock] {
             let sddl = super::windows_acl::capture(path).unwrap();
-            assert!(sddl.contains("D:P"));
-            assert!(sddl.contains(";;FA;;;S-"));
+            assert!(
+                has_single_protected_full_control_ace(&sddl),
+                "unexpected private file DACL: {sddl}"
+            );
         }
     }
 
@@ -218,7 +238,9 @@ mod tests {
         super::windows_acl::create_private(&path).unwrap();
 
         let sddl = super::windows_acl::capture(&path).unwrap();
-        assert!(sddl.contains("D:P"));
-        assert!(sddl.contains(";;FA;;;S-"));
+        assert!(
+            has_single_protected_full_control_ace(&sddl),
+            "unexpected private file DACL: {sddl}"
+        );
     }
 }
