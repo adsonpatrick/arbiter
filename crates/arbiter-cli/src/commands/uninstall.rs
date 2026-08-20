@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use arbiter_adapter_codex::uninstall_profile;
+use arbiter_adapter_codex::{OriginalPermissions, atomic_replace_private, uninstall_profile};
 
 use super::{
     Paths, ServerMetadata, read_config, read_json, read_receipt,
@@ -65,7 +65,8 @@ async fn stop_daemon(paths: &Paths, config: &super::LocalConfig) -> anyhow::Resu
         std::fs::remove_file(&paths.server).context("remove stale server metadata")?;
         return Ok(());
     }
-    std::fs::write(&paths.stop, b"stop\n").context("request daemon shutdown")?;
+    atomic_replace_private(&paths.stop, b"stop\n", &OriginalPermissions::default())
+        .context("request daemon shutdown")?;
     for _ in 0..50 {
         if !paths.server.exists() {
             break;
@@ -83,7 +84,7 @@ async fn stop_daemon(paths: &Paths, config: &super::LocalConfig) -> anyhow::Resu
 
 #[cfg(test)]
 mod tests {
-    use arbiter_adapter_codex::{InstallReceipt, ManagedFileReceipt};
+    use arbiter_adapter_codex::{InstallReceipt, ManagedFileReceipt, OriginalPermissions};
     use tempfile::tempdir;
 
     use super::{Paths, require_safe_backup_paths};
@@ -113,6 +114,7 @@ mod tests {
             original_sha256: "hash".to_owned(),
             installed_sha256: "hash".to_owned(),
             original_existed: true,
+            original_permissions: OriginalPermissions::default(),
         };
         let receipt = InstallReceipt {
             config: outside_receipt.clone(),

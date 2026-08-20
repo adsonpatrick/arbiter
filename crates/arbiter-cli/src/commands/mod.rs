@@ -6,12 +6,13 @@ mod uninstall;
 
 use std::{
     env, fs,
-    io::Write,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, bail};
-use arbiter_adapter_codex::InstallReceipt;
+use arbiter_adapter_codex::{
+    InstallReceipt, OriginalPermissions, atomic_replace_private, ensure_private_dir,
+};
 use arbiter_core::{config::BaselineTarget, health::DaemonIdentity};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -130,14 +131,10 @@ pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
 
 pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     let parent = path.parent().context("metadata path has no parent")?;
-    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    let bytes = serde_json::to_vec_pretty(value).context("serialize local metadata")?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(&bytes)?;
-    temporary.write_all(b"\n")?;
-    temporary.flush()?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
+    ensure_private_dir(parent).with_context(|| format!("create private {}", parent.display()))?;
+    let mut bytes = serde_json::to_vec_pretty(value).context("serialize local metadata")?;
+    bytes.push(b'\n');
+    atomic_replace_private(path, &bytes, &OriginalPermissions::default())?;
     Ok(())
 }
 

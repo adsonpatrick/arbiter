@@ -1,7 +1,9 @@
 use std::{process::Stdio, time::Duration};
 
 use anyhow::{Context, bail};
-use arbiter_adapter_codex::validate_managed_profile;
+use arbiter_adapter_codex::{
+    OriginalPermissions, atomic_replace_private, validate_managed_profile,
+};
 use arbiter_daemon::{
     AppState, DEFAULT_SHUTDOWN_GRACE, serve_local_with_shutdown, shutdown_signal,
 };
@@ -53,7 +55,8 @@ pub(crate) async fn run(paths: &Paths, foreground: bool) -> anyhow::Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    std::fs::write(&paths.stop, b"stop\n").context("request failed daemon startup shutdown")?;
+    atomic_replace_private(&paths.stop, b"stop\n", &OriginalPermissions::default())
+        .context("request failed daemon startup shutdown")?;
     bail!("Arbiter daemon did not become healthy")
 }
 

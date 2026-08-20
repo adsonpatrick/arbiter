@@ -8,7 +8,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use toml_edit::{DocumentMut, Item, Table, value};
 
-use crate::config_file::{atomic_replace, sha256, write_new_synced};
+use crate::{
+    config_file::sha256,
+    file_security::{
+        OriginalPermissions, atomic_replace_private, atomic_replace_with_permissions,
+        ensure_private_dir, write_new_private_synced,
+    },
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedFileReceipt {
@@ -18,6 +24,8 @@ pub struct ManagedFileReceipt {
     pub original_sha256: String,
     pub installed_sha256: String,
     pub original_existed: bool,
+    #[serde(default)]
+    pub original_permissions: OriginalPermissions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,9 +70,9 @@ pub fn install_profile(
     let profile_path = managed_profile_path(config_path)?;
     let (original, original_existed) = read_optional(config_path)?;
     let (profile_original, profile_original_existed) = read_optional(&profile_path)?;
-    if profile_original_existed {
-        return Err(CodexProfileError::ManagedEntryExists);
-    }
+    let original_permissions = OriginalPermissions::capture(config_path, original_existed)?;
+    let profile_original_permissions =
+        OriginalPermissions::capture(&profile_path, profile_original_existed)?;
 
     let mut document = std::str::from_utf8(&original)?.parse::<DocumentMut>()?;
     if managed_entry_exists(&document, "model_providers") {
@@ -75,7 +83,8 @@ pub fn install_profile(
     let profile_installed = profile_document().to_string().into_bytes();
 
     let backups = arbiter_home.join("backups");
-    fs::create_dir_all(&backups)?;
+    ensure_private_dir(arbiter_home)?;
+    ensure_private_dir(&backups)?;
     let config_receipt = backup_resource(
         config_path,
         &backups,
@@ -84,6 +93,7 @@ pub fn install_profile(
         &original,
         &installed,
         original_existed,
+        original_permissions.clone(),
     )?;
     let profile_receipt = backup_resource(
         &profile_path,
@@ -93,12 +103,22 @@ pub fn install_profile(
         &profile_original,
         &profile_installed,
         profile_original_existed,
+        profile_original_permissions.clone(),
     )?;
 
-    atomic_replace(config_path, &installed)?;
-    if let Err(error) = atomic_replace(&profile_path, &profile_installed) {
-        restore_bytes(config_path, &original, original_existed)?;
-        return Err(error);
+    atomic_replace_private(config_path, &installed, &original_permissions)?;
+    if let Err(error) = atomic_replace_private(
+        &profile_path,
+        &profile_installed,
+        &profile_original_permissions,
+    ) {
+        restore_bytes(
+            config_path,
+            &original,
+            original_existed,
+            &original_permissions,
+        )?;
+        return Err(error.into());
     }
 
     Ok(InstallReceipt {
@@ -133,11 +153,13 @@ pub fn uninstall_profile(
         &receipt.config.path,
         &config_backup,
         receipt.config.original_existed,
+        &receipt.config.original_permissions,
     )?;
     restore_bytes(
         &receipt.profile.path,
         &profile_backup,
         receipt.profile.original_existed,
+        &receipt.profile.original_permissions,
     )
 }
 
@@ -186,12 +208,13 @@ fn backup_resource(
     original: &[u8],
     installed: &[u8],
     original_existed: bool,
+    original_permissions: OriginalPermissions,
 ) -> Result<ManagedFileReceipt, CodexProfileError> {
     let original_sha256 = sha256(original);
     let backup_path = backup_root.join(format!("{name}-{timestamp_unix_ms}.toml"));
     let backup_hash_path = backup_path.with_extension("toml.sha256");
-    write_new_synced(&backup_path, original)?;
-    write_new_synced(&backup_hash_path, format!("{original_sha256}\n").as_bytes())?;
+    write_new_private_synced(&backup_path, original)?;
+    write_new_private_synced(&backup_hash_path, format!("{original_sha256}\n").as_bytes())?;
     Ok(ManagedFileReceipt {
         path: path.to_owned(),
         backup_path,
@@ -199,6 +222,7 @@ fn backup_resource(
         original_sha256,
         installed_sha256: sha256(installed),
         original_existed,
+        original_permissions,
     })
 }
 
@@ -217,9 +241,14 @@ fn verified_backup(receipt: &ManagedFileReceipt) -> Result<Vec<u8>, CodexProfile
     }
 }
 
-fn restore_bytes(path: &Path, bytes: &[u8], existed: bool) -> Result<(), CodexProfileError> {
+fn restore_bytes(
+    path: &Path,
+    bytes: &[u8],
+    existed: bool,
+    permissions: &OriginalPermissions,
+) -> Result<(), CodexProfileError> {
     if existed {
-        atomic_replace(path, bytes)
+        atomic_replace_with_permissions(path, bytes, permissions).map_err(Into::into)
     } else {
         match fs::remove_file(path) {
             Ok(()) => Ok(()),

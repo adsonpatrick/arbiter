@@ -13,6 +13,9 @@ use std::{
 
 use tempfile::tempdir;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 const ORIGINAL_CODEX_CONFIG: &str = "# user config\nprofile = \"daily\"\n";
 
 fn arbiter(home: &Path, codex_home: &Path, args: &[&str]) -> std::process::Output {
@@ -178,6 +181,27 @@ fn stale_metadata_plus_generic_health_is_not_accepted_as_arbiter() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized process"));
     }
     assert!(arbiter_home.join("install-receipt.json").exists());
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            std::fs::metadata(&arbiter_home)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+        for path in [
+            arbiter_home.join("config.json"),
+            arbiter_home.join("arbiter.db"),
+            arbiter_home.join("install-receipt.json"),
+        ] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o177,
+                0
+            );
+        }
+    }
 }
 
 #[test]

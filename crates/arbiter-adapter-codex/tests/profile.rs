@@ -3,6 +3,9 @@ use arbiter_adapter_codex::{
 };
 use tempfile::tempdir;
 
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
 const ORIGINAL: &str = include_str!("../../../tests/fixtures/codex_config_existing_provider.toml");
 
 #[test]
@@ -195,21 +198,71 @@ fn uninstall_removes_a_config_that_did_not_exist_before_install() {
 }
 
 #[test]
-fn install_refuses_to_overwrite_an_existing_named_profile_file() {
+fn install_replaces_and_exactly_restores_an_existing_named_profile_file() {
     let temporary = tempdir().unwrap();
     let config_path = temporary.path().join("codex/config.toml");
     let profile_path = config_path.parent().unwrap().join("arbiter.config.toml");
     let arbiter_home = temporary.path().join("arbiter");
     std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
     std::fs::write(&config_path, ORIGINAL).unwrap();
-    std::fs::write(&profile_path, "model = \"user-owned\"\n").unwrap();
+    let original_profile = b"# prior profile\nmodel = \"gpt-5\"\n";
+    std::fs::write(&profile_path, original_profile).unwrap();
 
-    let error = install_profile(&config_path, &arbiter_home, 43_123, 7).unwrap_err();
+    #[cfg(unix)]
+    std::fs::set_permissions(&profile_path, std::fs::Permissions::from_mode(0o400)).unwrap();
 
-    assert!(matches!(error, CodexProfileError::ManagedEntryExists));
-    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), ORIGINAL);
+    let receipt = install_profile(&config_path, &arbiter_home, 43_123, 7).unwrap();
+
+    assert!(receipt.profile.original_existed);
+    assert_ne!(std::fs::read(&profile_path).unwrap(), original_profile);
+
+    uninstall_profile(&config_path, &receipt).unwrap();
+
+    assert_eq!(std::fs::read(&config_path).unwrap(), ORIGINAL.as_bytes());
+    assert_eq!(std::fs::read(&profile_path).unwrap(), original_profile);
+    #[cfg(unix)]
     assert_eq!(
-        std::fs::read_to_string(profile_path).unwrap(),
-        "model = \"user-owned\"\n"
+        std::fs::metadata(&profile_path).unwrap().mode() & 0o777,
+        0o400
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_directories_and_backups_are_owner_only_and_stricter_modes_survive() {
+    let temporary = tempdir().unwrap();
+    let config_path = temporary.path().join("codex/config.toml");
+    let profile_path = config_path.parent().unwrap().join("arbiter.config.toml");
+    let arbiter_home = temporary.path().join("arbiter");
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::fs::write(&config_path, ORIGINAL).unwrap();
+    std::fs::write(&profile_path, "model = \"private\"\n").unwrap();
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+    std::fs::set_permissions(&profile_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+    let receipt = install_profile(&config_path, &arbiter_home, 43_123, 9).unwrap();
+
+    for directory in [&arbiter_home, &arbiter_home.join("backups")] {
+        assert_eq!(std::fs::metadata(directory).unwrap().mode() & 0o077, 0);
+    }
+    for file in [
+        &receipt.config.backup_path,
+        &receipt.config.backup_hash_path,
+        &receipt.profile.backup_path,
+        &receipt.profile.backup_hash_path,
+        &config_path,
+        &profile_path,
+    ] {
+        assert_eq!(std::fs::metadata(file).unwrap().mode() & 0o177, 0);
+    }
+
+    uninstall_profile(&config_path, &receipt).unwrap();
+    assert_eq!(
+        std::fs::metadata(&config_path).unwrap().mode() & 0o777,
+        0o400
+    );
+    assert_eq!(
+        std::fs::metadata(&profile_path).unwrap().mode() & 0o777,
+        0o400
     );
 }
