@@ -1,7 +1,7 @@
 # Arbiter M0 release checklist
 
-Date: 2026-08-20  
-Version: `0.1.0`  
+Date: 2026-08-20
+Version: `0.1.0`
 Final evidence parent: `331db47`
 
 ## Decision

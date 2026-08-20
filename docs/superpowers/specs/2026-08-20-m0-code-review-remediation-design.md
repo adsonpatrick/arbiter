@@ -1,7 +1,7 @@
 # Arbiter M0 Code Review Remediation Design
 
-**Date:** 2026-08-20  
-**Status:** Approved design, pending implementation  
+**Date:** 2026-08-20
+**Status:** Approved design, pending implementation
 **Review range:** `16007feaf282b8de0599b1db6209da06943577fb..d79c4556fd78bd714b90eb584fadfda912e78d05`
 
 ## 1. Objective
