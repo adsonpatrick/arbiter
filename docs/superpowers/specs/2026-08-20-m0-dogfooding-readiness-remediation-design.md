@@ -167,8 +167,7 @@ Tests must prove:
   upstream;
 - its non-governed fields remain semantically intact after normalization;
 - the model and reasoning effort are still normalized;
-- a request at the documented boundary is accepted where the framework permits
-  an exact boundary assertion deterministically;
+- a syntactically valid JSON request whose total HTTP body is exactly 32 MiB is accepted;
 - a request one byte over the maximum receives `413`;
 - an oversized request produces zero upstream calls;
 - an oversized request produces zero attempt lifecycle rows;
@@ -240,7 +239,7 @@ arbiter start
     |
     +-- open/reconcile SQLite
     |
-    +-- generate/retain current daemon instance identity
+    +-- generate a fresh daemon instance identity
     |
     +-- atomically publish current endpoint into managed Codex profile
     |
@@ -262,24 +261,56 @@ Installation remains responsible for:
 - creating Arbiter-owned state;
 - backing up the original Codex files;
 - installing/owning the managed Arbiter provider/profile contract;
-- recording restoration receipts.
+- recording restoration receipts;
+- generating the local control credential.
 
-Starting the daemon becomes responsible for publishing the **current** provider
-endpoint.
-
-The local configuration must distinguish installation configuration from active
-runtime endpoint state. An implementation may evolve the current schema rather than
-introducing an entirely new file, but these meanings must not remain conflated.
-
-The fixed fields remain:
+`config.json` advances to schema version 2 and contains installation invariants,
+not active daemon identity:
 
 - mode = `passthrough`;
 - baseline = Terra/Medium;
 - bind address = `127.0.0.1`;
-- remote export = false.
+- remote export = false;
+- Codex configuration path.
 
-The active port must be derived from the already-owned listener and atomically
-written to the managed provider configuration.
+The active `port` and daemon `instance_id` are removed from installation
+configuration. They belong only to runtime `server.json` and the authenticated
+control response. A fresh `instance_id` is generated on every successful daemon
+start.
+
+Immediately after `init`, the managed provider uses this explicit inactive endpoint:
+
+```text
+http://127.0.0.1:0/v1
+```
+
+Port zero is never used for inference. The implementation must include a contract
+test proving that the Codex configuration accepts the URL syntax and that no
+successful TCP connection can be made through the inactive endpoint on supported
+platforms.
+
+Starting the daemon becomes responsible for publishing the **current** provider
+endpoint only after binding `127.0.0.1:0` and learning the actual listener port.
+
+Because the current installation receipt verifies the whole installed Codex file,
+runtime endpoint publication must update the managed config and its receipt as one
+compensating state transition:
+
+1. verify the current config/profile and receipt are mutually consistent;
+2. stage the new Codex config containing only the new Arbiter `base_url`;
+3. stage the receipt with the corresponding new installed hash;
+4. persist the Codex config atomically;
+5. persist the updated receipt atomically;
+6. if step 5 fails, restore the exact previously installed Codex config;
+7. if compensation fails, report a compound recovery error and do not mark the
+   daemon READY.
+
+The original pre-Arbiter backup/hash never changes. Therefore uninstall always has
+the same restoration baseline even though Arbiter's managed `base_url` evolves at
+runtime.
+
+No runtime publication may change unrelated Codex keys or the managed model,
+provider ID, retry settings, auth mode, or reasoning effort.
 
 ### 5.6 Public health surface
 
@@ -307,10 +338,19 @@ Arbiter therefore introduces a local control credential stored in an owner-only
 Arbiter file. The control credential authenticates **Arbiter CLI to Arbiter daemon**
 for management operations. It is not forwarded to Codex or ChatGPT.
 
-The daemon exposes a control identity endpoint, either:
+The daemon exposes exactly one M0 management identity route:
 
-- a dedicated loopback HTTP endpoint requiring the control credential; or
-- an equivalent localhost control route with the same properties.
+```text
+GET /control/identity
+X-Arbiter-Control-Token: <credential>
+```
+
+The credential is a 32-byte cryptographically random value encoded as unpadded
+base64url and stored at:
+
+```text
+$ARBITER_HOME/control-token
+```
 
 The control endpoint returns the exact daemon identity required by CLI lifecycle
 validation:
@@ -322,15 +362,21 @@ validation:
 
 Control requirements:
 
-1. credential is generated with cryptographically secure randomness;
-2. credential is stored only in owner-only Arbiter state;
-3. credential never appears in logs;
-4. credential never appears in Codex config;
-5. credential is never forwarded upstream;
-6. unauthenticated or incorrect control requests receive a non-revealing denial;
-7. CLI uses this control endpoint for `start`, `status`, `doctor`, and `uninstall`
+1. the credential is generated during `arbiter init codex --yes` using an OS-backed
+   cryptographically secure random source;
+2. the credential file is created owner-only using the same cross-platform private
+   file primitives as other Arbiter secrets;
+3. the daemon reads the credential from Arbiter-owned state at startup and does not
+   copy it into public health state, server metadata, SQLite, or Codex configuration;
+4. the header value is marked sensitive before any structured HTTP instrumentation
+   can observe it;
+5. the credential never appears in logs;
+6. the credential is never forwarded upstream;
+7. missing or incorrect credentials return `404 Not Found`, the same result used
+   for an unavailable control resource, and include no daemon identity;
+8. CLI uses `GET /control/identity` for `start`, `status`, `doctor`, and `uninstall`
    identity validation;
-8. public `/healthz` alone is insufficient to establish daemon ownership.
+9. public `/healthz` alone is insufficient to establish daemon ownership.
 
 This protects management decisions from a generic local listener while avoiding the
 false claim that Codex inference requests themselves have cryptographic server
@@ -341,14 +387,20 @@ authentication.
 #### Normal shutdown
 
 - stop admission;
+- while the listener is still owned, atomically republish the managed provider to
+  the inactive `127.0.0.1:0` endpoint and update the current installed hash in the
+  receipt using the same compensating mutation protocol;
 - complete existing bounded shutdown behavior;
 - persist/cancel attempts according to existing rules;
 - remove active server metadata only if identity ownership still matches;
-- leave installation receipts/backups untouched.
+- retain the immutable original backups/restoration hashes.
 
-The managed profile may retain the last endpoint while stopped, but the next start
-must replace it only after binding a new endpoint. No command may treat the stale
-profile port as proof of a running daemon.
+If endpoint depublication fails, shutdown must emit a privacy-safe high-severity
+diagnostic and continue bounded process cleanup; it must never forge a successful
+depublication record. The residual stale-endpoint risk is then visible to
+`doctor`/`status` and remains within the explicitly accepted local-host residual.
+
+No command may treat a stale profile port as proof of a running daemon.
 
 #### Restart
 
@@ -356,9 +408,10 @@ A restart must:
 
 - obtain a different OS-selected ephemeral port in normal operation;
 - bind it before profile publication;
-- update the provider endpoint atomically;
+- update the provider endpoint and current receipt hash through the compensating
+  publication transition;
 - preserve unrelated Codex configuration;
-- keep the same exact uninstall restoration baseline.
+- keep the same exact immutable pre-Arbiter uninstall restoration baseline.
 
 Tests must not require mathematical uniqueness of ephemeral ports across all OS
 schedules, but must demonstrate that startup requests port `0` and does not reuse a
