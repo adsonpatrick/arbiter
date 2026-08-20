@@ -122,11 +122,11 @@ Untrusted content may contribute semantic signals but cannot expand budgets, inc
 
 ### 4.3 Codex-managed authentication boundary
 
-M0 does not create, request, read, refresh, or persist an OpenAI API key. The managed Codex provider sets `requires_openai_auth = true`, so Codex uses its existing OpenAI login—ChatGPT subscription login or API-key login chosen in Codex—and sends the resulting authorization on the localhost request. Codex remains the credential owner and refresh authority.
+M0 does not create, request, read, refresh, or persist an OpenAI API key. The managed Codex provider sets `requires_openai_auth = true`, so Codex uses its existing ChatGPT subscription login and sends the resulting authorization on the localhost request. Codex remains the credential owner and refresh authority. API-key-authenticated Codex sessions are outside M0 because they use a different upstream contract.
 
 Arbiter may hold the incoming authorization value in memory only long enough to forward that request to the pinned Codex upstream. It MUST NOT read `~/.codex/auth.json`, query the operating-system credential store, write credentials to Arbiter configuration, or expose credential values through CLI output, logs, events, errors, metrics, or remote sinks.
 
-Credential forwarding is destination-constrained: M0 forwards authorization only to the contract-verified HTTPS Codex upstream host, with redirects disabled. Authorization is never forwarded to a caller-selected URL. `Cookie` and `Proxy-Authorization` remain forbidden. Required non-secret Codex/OpenAI account or workspace headers may be forwarded only when contract tests prove they are necessary, and their values receive the same no-log/no-persist treatment as authorization.
+Credential forwarding is destination-constrained: M0 forwards authorization only to `https://chatgpt.com/backend-api/codex/responses`, with redirects disabled. Authorization is never forwarded to a caller-selected URL. `Cookie` and `Proxy-Authorization` remain forbidden. Required non-secret Codex/OpenAI account or workspace headers may be forwarded only when contract tests prove they are necessary, and their values receive the same no-log/no-persist treatment as authorization.
 
 ## 5. Runtime Domain Model
 
@@ -497,6 +497,7 @@ Version Governor software (SemVer), PolicyVersion, RegistryVersion, StorageSchem
 24. Atomic policy activation exposes either old or new complete artifact, never partial state.
 25. M0 requires no Arbiter-owned API credential and never reads Codex credential storage.
 26. Authorization can reach only the pinned, contract-verified Codex upstream and is never logged, persisted, exported, or included in diagnostics.
+27. M0 requires an active Codex ChatGPT login; API-key-authenticated Codex sessions fail doctor with an explicit unsupported-auth-mode result.
 
 ## 24. Architectural Invariants
 

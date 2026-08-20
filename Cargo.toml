@@ -5,7 +5,7 @@ members = [
     "crates/arbiter-cli",
     "crates/arbiter-core",
     "crates/arbiter-daemon",
-    "crates/arbiter-provider-openai",
+    "crates/arbiter-provider-codex",
     "crates/arbiter-storage-sqlite",
 ]
 

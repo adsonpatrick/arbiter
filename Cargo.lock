@@ -112,7 +112,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arbiter-core",
- "arbiter-provider-openai",
+ "arbiter-provider-codex",
  "arbiter-storage-sqlite",
  "axum",
  "tokio",
@@ -122,16 +122,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "arbiter-provider-openai"
+name = "arbiter-provider-codex"
 version = "0.1.0"
 dependencies = [
  "arbiter-core",
+ "axum",
  "bytes",
  "futures-util",
  "http",
  "reqwest",
  "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

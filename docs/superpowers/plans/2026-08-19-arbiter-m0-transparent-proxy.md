@@ -22,7 +22,8 @@
 - One upstream provider invocation equals one immutable attempt record.
 - Raw prompts, source code, model output, Authorization headers, cookies, API keys, and environment secrets MUST NOT be persisted by default.
 - M0 MUST NOT create, request, read, refresh, or persist an API key or Codex credential. It MUST NOT read `~/.codex/auth.json` or the operating-system credential store.
-- Incoming authorization may be held in memory only for the active request and forwarded only to the pinned, contract-verified HTTPS Codex upstream. Redirects are disabled so credentials cannot cross origins.
+- M0 supports Codex ChatGPT login only. API-key-authenticated Codex sessions are rejected because they use a different upstream contract.
+- Incoming authorization may be held in memory only for the active request and forwarded only to `https://chatgpt.com/backend-api/codex/responses`. Redirects are disabled so credentials cannot cross origins.
 - `SECRET` data is never exportable.
 - SQLite is sufficient for M0 core operation; no Supabase dependency is permitted.
 - Codex upstream retry is owned by Arbiter. Reqwest performs no automatic semantic retry; Codex custom-provider retries MUST be set to zero in the managed profile for M0 contract tests so retry amplification is measurable.
@@ -40,7 +41,7 @@
 5. LiteLLM remains optional because direct Codex behavior with the same Codex-managed login is the authoritative compatibility baseline.
 6. SQLx supports SQLite pools, migrations, and explicit transactions. M0 uses it for durable append-only events and remains ready for M1 budget reservations without replacing persistence.
 7. Codex owns credential acquisition and refresh. Arbiter receives authorization on the localhost provider request, never reads Codex credential storage, and forwards secrets only to the pinned Codex upstream with redirects disabled.
-8. Contract evidence on 2026-08-20: the official [Codex authentication documentation](https://learn.chatgpt.com/docs/auth) defines `requires_openai_auth = true` specifically for LLM proxies and permits ChatGPT login; the official [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference) defines the custom-provider fields; local `codex login status` reports ChatGPT authentication on Codex CLI `0.148.0-alpha.21`.
+8. Contract evidence on 2026-08-20: the official [Codex authentication documentation](https://learn.chatgpt.com/docs/auth) defines `requires_openai_auth = true` specifically for LLM proxies and permits ChatGPT login; the official [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference) defines the custom-provider fields; OpenAI Codex source commit `9894a14c81e50bbd845a337e4f77293f1cbc2633` defines the ChatGPT Codex base URL as `https://chatgpt.com/backend-api/codex`; local `codex login status` reports ChatGPT authentication on Codex CLI `0.148.0-alpha.21`.
 
 ## Planned Repository Structure
 
@@ -183,7 +184,7 @@ docs/
 - [ ] Create a terminal Responses SSE fixture and a failing parser test for response ID, input/cached/output/reasoning token fields.
 - [ ] Implement an incremental SSE metadata parser tolerant of arbitrary byte chunk boundaries; test every split point of the fixture.
 - [ ] Build Reqwest client with redirects disabled and no application retry loop.
-- [ ] Accept incoming `Authorization` only from the localhost Codex request and forward it unchanged only to the pinned, contract-verified HTTPS Codex upstream. Override `Host`; never forward `Cookie`, `Proxy-Authorization`, hop-by-hop headers, or authorization to redirects/caller-selected origins.
+- [ ] Accept incoming `Authorization` only from the localhost Codex request and forward it unchanged only to `https://chatgpt.com/backend-api/codex/responses`. Override `Host`; never forward `Cookie`, `Proxy-Authorization`, hop-by-hop headers, or authorization to redirects/caller-selected origins.
 - [ ] Prove with a fake upstream that authorization is forwarded for the active request but its value never appears in errors, debug output, persisted metadata, or provider structs after request construction.
 - [ ] Forward required non-secret Codex headers and any contract-required account/workspace headers without logging or persistence; document each allowlisted header.
 - [ ] Normalize only `model = gpt-5.6-terra` and `reasoning.effort = medium`; preserve all other request fields semantically, including unknown fields.
@@ -243,7 +244,7 @@ docs/
 - [ ] Initialize Arbiter home, DB/migrations, local config, Codex backup, managed provider/profile. Remain PASSTHROUGH.
 - [ ] Implement `start` without resolving or reading credentials; start the local daemon and write server metadata containing PID/port/version only.
 - [ ] Implement `status`: daemon health, PASSTHROUGH mode, baseline, provider reachability, storage integrity, Codex profile state, recent attempt counts.
-- [ ] Implement `doctor`: config parse, DB integrity, port, `codex login status` success without reading credential storage, Terra/Medium contract config, Codex binary, `requires_openai_auth = true`, managed profile/provider, no remote export, local binding only. Required failures return nonzero.
+- [ ] Implement `doctor`: config parse, DB integrity, port, `codex login status` reporting ChatGPT authentication without reading credential storage, Terra/Medium contract config, Codex binary, `requires_openai_auth = true`, managed profile/provider, no remote export, local binding only. API-key auth is unsupported in M0. Required failures return nonzero.
 - [ ] Implement `uninstall`: stop daemon, safely restore Codex config, preserve Arbiter DB by default and print its path for manual deletion.
 - [ ] Test full `init -> status -> uninstall` with temporary HOME.
 - [ ] Commit: `feat: add m0 arbiter cli lifecycle`.
@@ -260,7 +261,7 @@ Contract tests are ignored by default and require an authenticated local Codex s
 - [ ] Do not assert one Codex command equals one model call; Codex is agentic.
 - [ ] Probe cancellation by terminating a streaming Codex request and prove no false AttemptCompleted is recorded.
 - [ ] Record tested Codex/Arbiter versions, target/effort, Responses behavior, cancellation, paths/headers, retry settings, date and PASS/FAIL without secrets/prompts/source.
-- [ ] Prove the proxy works with ChatGPT login and requires no Arbiter-owned API key. If the active Codex login uses an API key, treat it as Codex-owned and do not read or copy it.
+- [ ] Prove the proxy works with ChatGPT login and requires no Arbiter-owned API key. An API-key-authenticated Codex session must be rejected as unsupported by M0 without reading or copying the key.
 - [ ] M0 is not contract-complete until direct Codex and Codex-through-Arbiter probes pass. Material mismatch requires plan/spec amendment, not compatibility hacks.
 - [ ] Commit: `test: verify codex-authenticated m0 contracts`.
 
