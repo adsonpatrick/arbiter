@@ -13,6 +13,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
+use tokio::time::Instant;
 
 use crate::{AppState, proxy::responses};
 
@@ -108,25 +109,47 @@ where
     let mut server = Box::pin(server);
     tokio::pin!(shutdown);
 
-    let result = tokio::select! {
-        result = server.as_mut() => result,
+    let (result, deadline) = tokio::select! {
+        result = server.as_mut() => (result, Instant::now() + grace),
         () = &mut shutdown => {
+            let deadline = Instant::now() + grace;
+            let cleanup_reserve = Duration::from_secs(2).min(grace / 5);
+            let serving_deadline = deadline - cleanup_reserve;
             state.begin_shutdown();
             let _ = server_shutdown_tx.send(());
-            if let Ok(result) = tokio::time::timeout(grace, server.as_mut()).await {
-                result
+            if let Some(result) =
+                wait_until_deadline(serving_deadline, "graceful_http_drain", server.as_mut()).await
+            {
+                (result, deadline)
             } else {
                 state.force_cancel();
                 drop(server);
-                Ok(())
+                (Ok(()), deadline)
             }
         }
     };
 
-    let _ = tokio::time::timeout(grace, state.wait_for_idle()).await;
-    let _ = tokio::time::timeout(grace, state.wait_for_persistence()).await;
-    let _ = tokio::time::timeout(grace, state.store.close()).await;
+    let _ = wait_until_deadline(deadline, "active_streams", state.wait_for_idle()).await;
+    let _ = wait_until_deadline(
+        deadline,
+        "terminal_persistence",
+        state.wait_for_persistence(),
+    )
+    .await;
+    let _ = wait_until_deadline(deadline, "sqlite_close", state.store.close()).await;
     result
+}
+
+async fn wait_until_deadline<F, T>(deadline: Instant, phase: &'static str, future: F) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    if let Ok(output) = tokio::time::timeout_at(deadline, future).await {
+        Some(output)
+    } else {
+        tracing::warn!(shutdown_phase = phase, "shutdown deadline exhausted");
+        None
+    }
 }
 
 async fn healthz(State(state): State<AppState>) -> (StatusCode, Json<DaemonHealth>) {
@@ -171,4 +194,37 @@ async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
         "baseline": BaselineTarget::m0(),
         "storage_integrity": storage_integrity,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{future::pending, time::Duration};
+
+    use tokio::time::Instant;
+
+    use super::wait_until_deadline;
+
+    #[tokio::test]
+    async fn shutdown_phases_share_one_deadline() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(40);
+
+        assert!(
+            wait_until_deadline(deadline, "idle", pending::<()>())
+                .await
+                .is_none()
+        );
+        assert!(
+            wait_until_deadline(deadline, "persistence", pending::<()>())
+                .await
+                .is_none()
+        );
+        assert!(
+            wait_until_deadline(deadline, "close", pending::<()>())
+                .await
+                .is_none()
+        );
+
+        assert!(started.elapsed() < Duration::from_millis(90));
+    }
 }

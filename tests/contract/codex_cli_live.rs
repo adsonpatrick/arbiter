@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use arbiter_core::events::GovernorEventKind;
+use arbiter_core::events::{ErrorClass, GovernorEventKind};
 use arbiter_storage_sqlite::SqliteEventStore;
 use tempfile::tempdir;
 
@@ -93,20 +93,36 @@ async fn codex_profile_streams_through_arbiter_and_cancellation_never_completes(
     assert!(observed_start, "cancellation probe never reached Arbiter");
     child.kill().expect("terminate cancellation probe");
     let _ = child.wait();
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let store = SqliteEventStore::open(&database)
-        .await
-        .expect("reopen event store");
-    let cancelled = store
-        .latest_attempt_events()
-        .await
-        .expect("cancelled attempt events");
-    store.close().await;
-    assert!(
-        !cancelled
-            .iter()
-            .any(|event| { matches!(event.kind, GovernorEventKind::AttemptCompleted(_)) })
-    );
+    let cancelled = await_terminal_events(&database).await;
+    assert_eq!(cancelled.len(), 2);
+    assert!(matches!(
+        cancelled[0].kind,
+        GovernorEventKind::AttemptStarted(_)
+    ));
+    assert!(matches!(
+        cancelled[1].kind,
+        GovernorEventKind::AttemptFailed(ref failed)
+            if failed.error_class == ErrorClass::Cancelled
+    ));
+}
+
+async fn await_terminal_events(path: &Path) -> Vec<arbiter_core::events::GovernorEvent> {
+    let mut events = Vec::new();
+    for _ in 0..100 {
+        let store = SqliteEventStore::open(path)
+            .await
+            .expect("reopen event store");
+        events = store
+            .latest_attempt_events()
+            .await
+            .expect("cancelled attempt events");
+        store.close().await;
+        if events.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    events
 }
 
 fn arbiter(arbiter_home: &Path, args: &[&str]) -> std::process::Output {
