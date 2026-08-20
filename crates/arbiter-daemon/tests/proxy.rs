@@ -691,6 +691,69 @@ async fn permanent_terminal_write_failure_is_recovered_on_restart() {
     server.abort();
 }
 
+#[tokio::test]
+async fn oversized_sse_is_forwarded_exactly_and_fails_when_completion_is_unverifiable() {
+    let oversized = Bytes::from(vec![b'x'; 1_048_577]);
+    let completed = Bytes::from_static(include_bytes!(
+        "../../../tests/fixtures/response_completed.sse"
+    ));
+    let mut expected = Vec::with_capacity(oversized.len() + completed.len());
+    expected.extend_from_slice(&oversized);
+    expected.extend_from_slice(&completed);
+    let upstream_oversized = oversized.clone();
+    let upstream_completed = completed.clone();
+    let upstream = Router::new().route(
+        "/responses",
+        post(move || {
+            let chunks = stream::iter([
+                Ok::<_, std::convert::Infallible>(upstream_oversized.clone()),
+                Ok(upstream_completed.clone()),
+            ]);
+            async move {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(chunks))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider = CodexUpstreamProvider::new_for_loopback_test(listener.local_addr().unwrap())
+        .expect("test provider");
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let temporary = tempdir().unwrap();
+    let store = SqliteEventStore::open(temporary.path().join("arbiter.db"))
+        .await
+        .unwrap();
+    let app = build_router(AppState::new(provider, store.clone()));
+    let request = Request::post("/v1/responses")
+        .header(header::AUTHORIZATION, "Bearer oversized-sse")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"input": "hello"}).to_string()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    let attempt_id = AttemptId::from(
+        response.headers()["x-arbiter-attempt-id"]
+            .to_str()
+            .unwrap()
+            .parse::<uuid::Uuid>()
+            .unwrap(),
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), expected);
+    let events = wait_for_events(&store, attempt_id, 2).await;
+    assert!(matches!(
+        &events[1].kind,
+        GovernorEventKind::AttemptFailed(failed)
+            if failed.error_class == ErrorClass::StreamInterrupted
+    ));
+    server.abort();
+}
+
 async fn wait_for_events(
     store: &SqliteEventStore,
     attempt_id: AttemptId,

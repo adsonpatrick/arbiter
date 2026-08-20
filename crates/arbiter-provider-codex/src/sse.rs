@@ -1,5 +1,7 @@
 use arbiter_core::events::TokenUsage;
 
+const MAX_PENDING_EVENT_BYTES: usize = 1_048_576;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalResponseMetadata {
     pub response_id: String,
@@ -9,6 +11,7 @@ pub struct TerminalResponseMetadata {
 #[derive(Default)]
 pub struct SseMetadataParser {
     pending: Vec<u8>,
+    extraction_disabled: bool,
 }
 
 impl std::fmt::Debug for SseMetadataParser {
@@ -16,12 +19,21 @@ impl std::fmt::Debug for SseMetadataParser {
         formatter
             .debug_struct("SseMetadataParser")
             .field("pending_bytes", &self.pending.len())
+            .field("extraction_disabled", &self.extraction_disabled)
             .finish()
     }
 }
 
 impl SseMetadataParser {
     pub fn push(&mut self, chunk: &[u8]) -> Option<TerminalResponseMetadata> {
+        if self.extraction_disabled {
+            return None;
+        }
+        if self.pending.len().saturating_add(chunk.len()) > MAX_PENDING_EVENT_BYTES {
+            self.pending.clear();
+            self.extraction_disabled = true;
+            return None;
+        }
         self.pending.extend_from_slice(chunk);
         let mut terminal = None;
 
@@ -82,7 +94,7 @@ fn parse_terminal_event(event: &[u8]) -> Option<TerminalResponseMetadata> {
 
 #[cfg(test)]
 mod tests {
-    use super::SseMetadataParser;
+    use super::{MAX_PENDING_EVENT_BYTES, SseMetadataParser};
 
     const COMPLETED_RESPONSE: &[u8] =
         include_bytes!("../../../tests/fixtures/response_completed.sse");
@@ -122,7 +134,19 @@ mod tests {
 
         assert_eq!(
             format!("{parser:?}"),
-            "SseMetadataParser { pending_bytes: 34 }"
+            "SseMetadataParser { pending_bytes: 34, extraction_disabled: false }"
         );
+    }
+
+    #[test]
+    fn oversized_unterminated_event_disables_extraction_and_releases_pending_bytes() {
+        let mut parser = SseMetadataParser::default();
+        let oversized = vec![b'x'; MAX_PENDING_EVENT_BYTES + 1];
+
+        assert!(parser.push(&oversized).is_none());
+        assert!(parser.extraction_disabled);
+        assert!(parser.pending.len() <= MAX_PENDING_EVENT_BYTES);
+        assert!(parser.push(COMPLETED_RESPONSE).is_none());
+        assert!(parser.pending.is_empty());
     }
 }

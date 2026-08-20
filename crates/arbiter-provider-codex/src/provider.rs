@@ -219,7 +219,18 @@ fn forwarded_request_headers(incoming: &HeaderMap) -> Result<HeaderMap, Provider
     let mut forwarded = HeaderMap::new();
     for name in FORWARDED_REQUEST_HEADERS {
         if let Some(value) = incoming.get(*name) {
-            forwarded.insert(http::HeaderName::from_static(name), value.clone());
+            let mut value = value.clone();
+            if matches!(
+                *name,
+                "authorization"
+                    | "chatgpt-account-id"
+                    | "openai-organization"
+                    | "openai-project"
+                    | "x-oai-attestation"
+            ) {
+                value.set_sensitive(true);
+            }
+            forwarded.insert(http::HeaderName::from_static(name), value);
         }
     }
     Ok(forwarded)
@@ -280,7 +291,7 @@ mod tests {
     use http::{HeaderMap, HeaderValue, StatusCode, header};
     use serde_json::json;
 
-    use super::{CodexUpstreamProvider, normalize_request};
+    use super::{CodexUpstreamProvider, forwarded_request_headers, normalize_request};
 
     #[derive(Debug)]
     struct CapturedRequest {
@@ -352,6 +363,26 @@ mod tests {
         assert_eq!(normalized["reasoning"]["future_reasoning_field"], true);
         assert_eq!(normalized["input"][0]["content"], "source-sentinel");
         assert_eq!(normalized["future_top_level_field"]["nested"], 42);
+    }
+
+    #[test]
+    fn credential_and_account_headers_are_sensitive_without_changing_values() {
+        let mut incoming = HeaderMap::new();
+        incoming.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer session-token"),
+        );
+        incoming.insert("chatgpt-account-id", HeaderValue::from_static("account-id"));
+        incoming.insert("x-oai-attestation", HeaderValue::from_static("attestation"));
+
+        let forwarded = forwarded_request_headers(&incoming).unwrap();
+
+        assert_eq!(forwarded[header::AUTHORIZATION], "Bearer session-token");
+        assert_eq!(forwarded["chatgpt-account-id"], "account-id");
+        assert_eq!(forwarded["x-oai-attestation"], "attestation");
+        assert!(forwarded[header::AUTHORIZATION].is_sensitive());
+        assert!(forwarded["chatgpt-account-id"].is_sensitive());
+        assert!(forwarded["x-oai-attestation"].is_sensitive());
     }
 
     #[tokio::test]
