@@ -36,29 +36,29 @@
 
 ## File Structure Map
 
-Files created by this remediation:
+Files created:
 
 - `crates/arbiter-core/src/control.rs` — redacted control-token value object and control header constant.
 - `crates/arbiter-cli/src/commands/control.rs` — owner-only token generation/loading and authenticated control identity client.
-- `crates/arbiter-cli/src/commands/endpoint.rs` — one coordinator for Codex endpoint publication/depublication plus receipt persistence/compensation.
+- `crates/arbiter-cli/src/commands/endpoint.rs` — Codex endpoint publication/depublication plus receipt persistence/compensation.
 - `crates/arbiter-daemon/src/control.rs` — control-header sensitivity middleware and `/control/identity` handler.
 - `.github/workflows/ci.yml` — deterministic Linux/Windows CI gate.
-- `docs/m0/neurovia-dogfooding.md` — post-remediation personal-workstation dogfooding procedure and residual-risk statement.
+- `docs/m0/neurovia-dogfooding.md` — post-remediation dogfooding procedure and residual-risk statement.
 
-Files modified by this remediation:
+Files modified:
 
 - `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`
-- `crates/arbiter-core/src/config.rs`, `crates/arbiter-core/src/health.rs`, `crates/arbiter-core/src/lib.rs`
+- `crates/arbiter-core/src/config.rs`, `health.rs`, `lib.rs`
 - `crates/arbiter-provider-codex/src/provider.rs`
-- `crates/arbiter-adapter-codex/src/profile.rs`
+- `crates/arbiter-adapter-codex/src/profile.rs`, `lib.rs`
 - `crates/arbiter-cli/Cargo.toml`
 - `crates/arbiter-cli/src/commands/mod.rs`, `init.rs`, `start.rs`, `status.rs`, `doctor.rs`, `uninstall.rs`
-- `crates/arbiter-cli/tests/lifecycle.rs`, `crates/arbiter-cli/tests/contract.rs`
+- `crates/arbiter-cli/tests/lifecycle.rs`, `contract.rs`
 - `crates/arbiter-daemon/src/lib.rs`, `app.rs`, `state.rs`, `main.rs`
 - `crates/arbiter-daemon/tests/proxy.rs`, `privacy.rs`, `shutdown.rs`
 - `docs/m0/contract-gates.md`, `operations.md`, `performance.md`, `release-checklist.md`
 
-Do not create a second persistence layer, a second HTTP server, or an inference-side static secret header.
+Do not create a second persistence layer, second HTTP server, or inference-side static secret header.
 
 ---
 
@@ -71,11 +71,11 @@ Do not create a second persistence layer, a second HTTP server, or an inference-
 
 **Interfaces:**
 - Produces: `pub const M0_MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;`
-- Consumes later: the router and request-contract tests import that constant; no other task defines a second size value.
+- The router and tests import this single constant; no second request-size literal is authoritative.
 
-- [ ] **Step 1: Add failing exact-boundary and rejection tests**
+- [ ] **Step 1: Add the exact-body helper and failing tests**
 
-Add this helper near the proxy integration-test helpers in `crates/arbiter-daemon/tests/proxy.rs`:
+Add this helper to `crates/arbiter-daemon/tests/proxy.rs`:
 
 ```rust
 fn exact_json_body(total_bytes: usize) -> Vec<u8> {
@@ -93,50 +93,96 @@ fn exact_json_body(total_bytes: usize) -> Vec<u8> {
 }
 ```
 
-Add three integration tests using the existing loopback fake-provider pattern and `SqliteEventStore`:
+For the fake upstream used by these tests, disable its own Axum body limit so it cannot mask Arbiter behavior:
 
 ```rust
-#[tokio::test]
-async fn accepts_json_larger_than_axum_default_and_preserves_payload() { /* 3 MiB body */ }
-
-#[tokio::test]
-async fn accepts_exactly_m0_max_request_bytes() { /* exact_json_body(M0_MAX_REQUEST_BYTES) */ }
-
-#[tokio::test]
-async fn rejects_one_byte_over_m0_limit_before_attempt_or_upstream() { /* M0_MAX_REQUEST_BYTES + 1 */ }
+let upstream = Router::new()
+    .route("/responses", post(capture_request))
+    .layer(axum::extract::DefaultBodyLimit::disable());
 ```
 
-For the oversized case assert all of:
+Add the following four tests. Use the existing loopback `CodexUpstreamProvider::new_for_loopback_test`, `AppState`, and `SqliteEventStore` setup from this test file.
+
+For a body larger than Axum's default:
 
 ```rust
+let body = serde_json::json!({"input": "x".repeat(3 * 1024 * 1024)}).to_string();
+let request = Request::post("/v1/responses")
+    .header(header::AUTHORIZATION, "Bearer large-body-test")
+    .header(header::CONTENT_TYPE, "application/json")
+    .body(Body::from(body))
+    .unwrap();
+let response = app.oneshot(request).await.unwrap();
+assert_eq!(response.status(), StatusCode::OK);
+assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+```
+
+For the exact boundary:
+
+```rust
+let body = exact_json_body(arbiter_core::config::M0_MAX_REQUEST_BYTES);
+assert_eq!(body.len(), 33_554_432);
+let request = Request::post("/v1/responses")
+    .header(header::AUTHORIZATION, "Bearer exact-limit-test")
+    .header(header::CONTENT_TYPE, "application/json")
+    .body(Body::from(body))
+    .unwrap();
+let response = app.oneshot(request).await.unwrap();
+assert_eq!(response.status(), StatusCode::OK);
+assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+```
+
+For one byte over:
+
+```rust
+let body = exact_json_body(arbiter_core::config::M0_MAX_REQUEST_BYTES + 1);
+let request = Request::post("/v1/responses")
+    .header(header::AUTHORIZATION, "Bearer oversized-test")
+    .header(header::CONTENT_TYPE, "application/json")
+    .body(Body::from(body))
+    .unwrap();
+let response = app.oneshot(request).await.unwrap();
 assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 assert_eq!(upstream_calls.load(Ordering::SeqCst), 0);
 assert_eq!(store.recent_attempt_counts(0).await.unwrap().started, 0);
 ```
 
-Add a malformed JSON case with the same zero-attempt/zero-upstream assertions and HTTP 400.
+For malformed JSON:
 
-- [ ] **Step 2: Run the focused tests and verify the framework-default failure**
+```rust
+let request = Request::post("/v1/responses")
+    .header(header::AUTHORIZATION, "Bearer malformed-test")
+    .header(header::CONTENT_TYPE, "application/json")
+    .body(Body::from("{\"input\":"))
+    .unwrap();
+let response = app.oneshot(request).await.unwrap();
+assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+assert_eq!(upstream_calls.load(Ordering::SeqCst), 0);
+assert_eq!(store.recent_attempt_counts(0).await.unwrap().started, 0);
+```
 
-Run:
+The accepted-body upstream capture must assert that the normalized body still contains the entire `input`, fixed Terra model, medium effort, and any synthetic non-governed field supplied by the test.
+
+- [ ] **Step 2: Run the focused tests before implementation**
 
 ```bash
 cargo test -p arbiter-daemon --test proxy accepts_json_larger_than_axum_default_and_preserves_payload -- --exact
 cargo test -p arbiter-daemon --test proxy accepts_exactly_m0_max_request_bytes -- --exact
 cargo test -p arbiter-daemon --test proxy rejects_one_byte_over_m0_limit_before_attempt_or_upstream -- --exact
+cargo test -p arbiter-daemon --test proxy malformed_json_is_rejected_before_attempt_or_upstream -- --exact
 ```
 
-Expected before implementation: the >2 MiB accepted test fails with body rejection and the exact-boundary test cannot pass under the implicit Axum default.
+Expected before implementation: the accepted large-body tests fail under Axum's implicit default.
 
 - [ ] **Step 3: Define the single M0 request-size constant**
 
-In `crates/arbiter-core/src/config.rs` add:
+Add to `arbiter-core/src/config.rs`:
 
 ```rust
 pub const M0_MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 ```
 
-Add a unit assertion:
+and test:
 
 ```rust
 #[test]
@@ -145,9 +191,9 @@ fn m0_request_limit_is_exactly_32_mib() {
 }
 ```
 
-- [ ] **Step 4: Apply the limit at the Axum route boundary**
+- [ ] **Step 4: Apply the explicit limit only to Responses**
 
-In `crates/arbiter-daemon/src/app.rs`, import `axum::extract::DefaultBodyLimit` and `arbiter_core::config::M0_MAX_REQUEST_BYTES`. Apply the layer to the Responses route, not to health/control routes:
+In `arbiter-daemon/src/app.rs`:
 
 ```rust
 Router::new()
@@ -159,16 +205,14 @@ Router::new()
 
 Do not disable the limit globally and do not move attempt creation ahead of JSON extraction.
 
-- [ ] **Step 5: Run request-contract and existing proxy regressions**
-
-Run:
+- [ ] **Step 5: Run regressions**
 
 ```bash
 cargo test -p arbiter-daemon --test proxy
 cargo test -p arbiter-core config::tests
 ```
 
-Expected: all pass; exact 32 MiB is accepted, one byte over is 413, malformed JSON is 400, and both pre-attempt rejections create zero events/upstream calls.
+Expected: exact 32 MiB accepted, one byte over 413, malformed JSON 400, zero pre-attempt events/upstream calls.
 
 - [ ] **Step 6: Commit**
 
@@ -198,9 +242,9 @@ git commit -m "fix: enforce explicit m0 request limit"
 - Produces: `GET /control/identity` returning `DaemonIdentity` only for a valid token.
 - Changes: `DaemonHealth` no longer contains `identity`.
 
-- [ ] **Step 1: Write failing domain tests for a redacted control token**
+- [ ] **Step 1: Write failing `ControlToken` tests**
 
-Create `crates/arbiter-core/src/control.rs` initially with tests specifying the contract:
+Create `arbiter-core/src/control.rs` with these tests first:
 
 ```rust
 #[test]
@@ -209,6 +253,7 @@ fn control_token_accepts_only_43_char_base64url_values() {
     assert_eq!(token.expose(), "A".repeat(43));
     assert!(ControlToken::parse("short".to_owned()).is_err());
     assert!(ControlToken::parse(format!("{}=", "A".repeat(42))).is_err());
+    assert!(ControlToken::parse(format!("{}+", "A".repeat(42))).is_err());
 }
 
 #[test]
@@ -218,63 +263,141 @@ fn control_token_debug_is_redacted() {
 }
 ```
 
-Use 43 characters because 32 bytes encoded with base64url without padding has length 43.
-
-- [ ] **Step 2: Implement the minimal redacted value object**
-
-Implement:
+- [ ] **Step 2: Implement the complete redacted value object**
 
 ```rust
 pub const CONTROL_HEADER_NAME: &str = "x-arbiter-control-token";
+
+#[derive(Debug, thiserror::Error)]
+pub enum ControlTokenError {
+    #[error("Arbiter control token is not a 32-byte unpadded base64url value")]
+    InvalidFormat,
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ControlToken(String);
 
 impl ControlToken {
-    pub fn parse(value: String) -> Result<Self, ControlTokenError> { /* exact length + URL-safe alphabet */ }
-    pub fn expose(&self) -> &str { &self.0 }
+    pub fn parse(value: String) -> Result<Self, ControlTokenError> {
+        let valid = value.len() == 43
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+        if valid {
+            Ok(Self(value))
+        } else {
+            Err(ControlTokenError::InvalidFormat)
+        }
+    }
+
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ControlToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ControlToken([REDACTED])")
+    }
 }
 ```
 
-Allowed bytes are ASCII alphanumeric, `-`, and `_`. Implement a custom `Debug` that never prints the value. Export the module from `arbiter-core/src/lib.rs`.
+Export `pub mod control;` from `arbiter-core/src/lib.rs`.
 
-- [ ] **Step 3: Add failing daemon route tests**
+- [ ] **Step 3: Add failing public-health/control-route tests**
 
-In `crates/arbiter-daemon/tests/proxy.rs`, update test AppState creation with a deterministic 43-character test token and add:
+Use this deterministic test helper:
 
 ```rust
-#[tokio::test]
-async fn public_health_does_not_expose_daemon_identity() { /* no pid/port/instance_id */ }
-
-#[tokio::test]
-async fn control_identity_requires_exact_control_token() { /* 404 missing/wrong; 200 exact */ }
+fn test_control_token() -> arbiter_core::control::ControlToken {
+    arbiter_core::control::ControlToken::parse("A".repeat(43)).unwrap()
+}
 ```
 
-The successful response body must equal the expected `DaemonIdentity`. The public `/healthz` body must not contain keys `pid`, `port`, `instance_id`, or `identity`.
+Build `AppState::new_with_identity` with a known `DaemonIdentity` and add assertions:
+
+```rust
+let health = app
+    .clone()
+    .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+    .await
+    .unwrap();
+let health_bytes = axum::body::to_bytes(health.into_body(), 64 * 1024).await.unwrap();
+let health_json: serde_json::Value = serde_json::from_slice(&health_bytes).unwrap();
+assert!(health_json.get("identity").is_none());
+assert!(health_json.get("pid").is_none());
+assert!(health_json.get("port").is_none());
+assert!(health_json.get("instance_id").is_none());
+```
+
+For control identity:
+
+```rust
+let missing = app
+    .clone()
+    .oneshot(Request::get("/control/identity").body(Body::empty()).unwrap())
+    .await
+    .unwrap();
+assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+let wrong = app
+    .clone()
+    .oneshot(
+        Request::get("/control/identity")
+            .header(CONTROL_HEADER_NAME, "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+assert_eq!(wrong.status(), StatusCode::NOT_FOUND);
+
+let valid = app
+    .oneshot(
+        Request::get("/control/identity")
+            .header(CONTROL_HEADER_NAME, test_control_token().expose())
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+assert_eq!(valid.status(), StatusCode::OK);
+```
+
+Deserialize the valid body to `DaemonIdentity` and assert exact equality with the state identity.
 
 - [ ] **Step 4: Implement control middleware and handler**
 
-Create `crates/arbiter-daemon/src/control.rs` with:
+Create `arbiter-daemon/src/control.rs`:
 
 ```rust
 pub(crate) async fn mark_control_header_sensitive(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
-) -> axum::response::Response
-```
+) -> axum::response::Response {
+    if let Some(value) = request.headers_mut().get_mut(CONTROL_HEADER_NAME) {
+        value.set_sensitive(true);
+    }
+    next.run(request).await
+}
 
-If `CONTROL_HEADER_NAME` exists, call `HeaderValue::set_sensitive(true)` before `next.run(request).await`.
-
-Add:
-
-```rust
 pub(crate) async fn identity(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Response
+) -> Response {
+    let accepted = headers
+        .get(CONTROL_HEADER_NAME)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == state.control_token.expose());
+    if !accepted {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Json(state.identity.clone()).into_response()
+}
 ```
 
-Return `404` for missing/wrong tokens and `Json(state.identity.clone())` for an exact token. Do not log either presented or expected credentials.
+Do not log presented or expected tokens.
 
 - [ ] **Step 5: Remove identity from public health and wire the control route**
 
@@ -287,17 +410,11 @@ pub struct DaemonHealth {
 }
 ```
 
-Store `ControlToken` in `AppState`. Change both constructors to require it. In `build_router`, add:
+Store `ControlToken` in `AppState`, update both constructors to require it, add `/control/identity`, and layer `middleware::from_fn(control::mark_control_header_sensitive)` around the router before future HTTP instrumentation.
 
-```rust
-.route("/control/identity", get(control::identity))
-```
+- [ ] **Step 6: Prove the control header cannot reach upstream**
 
-and apply the sensitivity middleware before any future HTTP instrumentation.
-
-- [ ] **Step 6: Prove the control header can never reach ChatGPT**
-
-Extend `forwards_only_allowlisted_headers_and_streams_terminal_metadata` in `crates/arbiter-provider-codex/src/provider.rs`:
+Extend the provider allowlist test:
 
 ```rust
 headers.insert(
@@ -306,11 +423,13 @@ headers.insert(
 );
 ```
 
-and assert the captured upstream headers do not contain it.
+After capture:
+
+```rust
+assert!(!captured.headers.contains_key(arbiter_core::control::CONTROL_HEADER_NAME));
+```
 
 - [ ] **Step 7: Run focused tests**
-
-Run:
 
 ```bash
 cargo test -p arbiter-core control
@@ -318,8 +437,6 @@ cargo test -p arbiter-daemon --test proxy public_health_does_not_expose_daemon_i
 cargo test -p arbiter-daemon --test proxy control_identity_requires_exact_control_token -- --exact
 cargo test -p arbiter-provider-codex forwards_only_allowlisted_headers_and_streams_terminal_metadata
 ```
-
-Expected: all pass and no test/debug output contains the control value.
 
 - [ ] **Step 8: Commit**
 
@@ -333,12 +450,10 @@ git commit -m "security: separate arbiter control identity"
 ### Task 3: Move installation state to schema v2 and generate the owner-only control credential
 
 **Files:**
-- Modify: `Cargo.toml`
-- Modify: `Cargo.lock`
+- Modify: `Cargo.toml`, `Cargo.lock`
 - Modify: `crates/arbiter-cli/Cargo.toml`
 - Create: `crates/arbiter-cli/src/commands/control.rs`
-- Modify: `crates/arbiter-cli/src/commands/mod.rs`
-- Modify: `crates/arbiter-cli/src/commands/init.rs`
+- Modify: `crates/arbiter-cli/src/commands/mod.rs`, `init.rs`
 - Modify: `crates/arbiter-cli/tests/lifecycle.rs`
 
 **Interfaces:**
@@ -347,53 +462,90 @@ git commit -m "security: separate arbiter control identity"
 - Produces: `control::generate_and_store(paths) -> anyhow::Result<ControlToken>` and `control::read(paths) -> anyhow::Result<ControlToken>`.
 - Installation provider endpoint is exactly `http://127.0.0.1:0/v1`.
 
-- [ ] **Step 1: Write failing lifecycle tests for schema v2**
+- [ ] **Step 1: Write failing schema-v2 lifecycle test**
 
-Replace the obsolete installation-port assertion with:
+Use the existing `arbiter(...)` test helper:
 
 ```rust
 #[test]
 fn init_creates_schema_v2_without_runtime_identity() {
-    /* run arbiter init codex --yes */
+    let temporary = tempdir().unwrap();
+    let arbiter_home = temporary.path().join(".arbiter");
+    let codex_home = temporary.path().join(".codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+
+    let init = arbiter(&arbiter_home, &codex_home, &["init", "codex", "--yes"]);
+    assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
+
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(arbiter_home.join("config.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(config["schema_version"], 2);
     assert!(config.get("port").is_none());
     assert!(config.get("instance_id").is_none());
-    assert!(installed_codex_config.contains("base_url = \"http://127.0.0.1:0/v1\""));
+
+    let installed = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
+    assert!(installed.contains("base_url = \"http://127.0.0.1:0/v1\""));
+
+    let token = std::fs::read_to_string(arbiter_home.join("control-token")).unwrap();
+    assert_eq!(token.len(), 43);
+    assert!(token.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'));
 }
 ```
 
-Add a test that `arbiter init codex --port 43123` is rejected by Clap because `--port` no longer exists.
+Also add:
 
-Add a test that `$ARBITER_HOME/control-token` exists after `--yes`, contains exactly 43 base64url characters, and is owner-only on Unix. Extend existing Windows ACL coverage through the same private-file primitive rather than adding a second ACL implementation.
+```rust
+#[test]
+fn init_no_longer_accepts_a_persisted_port() {
+    let output = arbiter(&arbiter_home, &codex_home, &["init", "codex", "--port", "43123"]);
+    assert!(!output.status.success());
+}
+```
 
-- [ ] **Step 2: Add only the dependencies needed for the specified token format**
+Create complete temp paths in that test exactly as in the previous lifecycle test.
 
-In workspace dependencies:
+- [ ] **Step 2: Add only required token dependencies**
+
+Workspace:
 
 ```toml
 base64 = "0.22"
 getrandom = "0.3"
 ```
 
-Add both to `arbiter-cli/Cargo.toml`. Do not add `rand`, `secrecy`, or a second crypto abstraction.
+Add both as workspace dependencies in `arbiter-cli/Cargo.toml`; do not add a second random/secret abstraction.
 
-- [ ] **Step 3: Implement OS-random token generation**
+- [ ] **Step 3: Implement exact token generation/loading**
 
-In `commands/control.rs` implement generation exactly as:
+In `commands/control.rs`:
 
 ```rust
-let mut bytes = [0_u8; 32];
-getrandom::fill(&mut bytes).context("generate Arbiter control credential")?;
-let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-let token = ControlToken::parse(encoded)?;
-write_new_private_synced(&paths.control_token, token.expose().as_bytes())?;
+use base64::Engine as _;
+
+pub(crate) fn generate_and_store(paths: &Paths) -> anyhow::Result<ControlToken> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).context("generate Arbiter control credential")?;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let token = ControlToken::parse(encoded)?;
+    write_new_private_synced(&paths.control_token, token.expose().as_bytes())?;
+    Ok(token)
+}
+
+pub(crate) fn read(paths: &Paths) -> anyhow::Result<ControlToken> {
+    let bytes = std::fs::read(&paths.control_token)
+        .context("read Arbiter control credential")?;
+    let value = std::str::from_utf8(&bytes)
+        .context("Arbiter control credential is not UTF-8")?
+        .to_owned();
+    ControlToken::parse(value).map_err(Into::into)
+}
 ```
 
-`read(paths)` reads UTF-8 without trimming hidden extra bytes and validates through `ControlToken::parse`.
+Do not trim the file; unexpected bytes must invalidate it.
 
-- [ ] **Step 4: Convert CLI config to schema v2**
-
-Change `LocalConfig` to contain only:
+- [ ] **Step 4: Convert `LocalConfig` and CLI surface to schema v2**
 
 ```rust
 pub(crate) struct LocalConfig {
@@ -406,30 +558,49 @@ pub(crate) struct LocalConfig {
 }
 ```
 
-Change `default_config(paths)` accordingly and require `schema_version == 2` in `read_config`.
+`default_config(paths)` sets schema 2 and existing invariants. `read_config` rejects anything else. Remove `port` from `Command::Init` and the `init::run` signature.
 
-Remove `--port` from `Command::Init` and from `init::run`.
+Add:
 
-- [ ] **Step 5: Make init install only inactive state**
+```rust
+control_token: arbiter_home.join("control-token"),
+```
 
-Call existing `install_profile(..., 0, timestamp)` so the initial managed provider is `127.0.0.1:0`. Generate the control token before writing the final installation receipt. If any later install step fails, remove the newly created control-token file during rollback; never leave a half-installed credential as evidence of a successful install.
+to `Paths`.
 
-Add `control_token: arbiter_home.join("control-token")` to `Paths`.
+- [ ] **Step 5: Make init install inactive state and clean token on failure**
 
-- [ ] **Step 6: Prove port zero is inert**
+Call `install_profile(..., 0, timestamp)`. Generate the control credential using `generate_and_store` before the final receipt write. If profile installation or receipt persistence fails after token creation, remove `control-token` before returning; do not report initialization success.
 
-In lifecycle tests parse the installed `base_url`, assert it ends in `127.0.0.1:0/v1`, and assert `TcpStream::connect(("127.0.0.1", 0))` does not succeed. This is a syntax/configuration contract test, not a provider live call.
+- [ ] **Step 6: Prove port zero is inert and token is private**
 
-- [ ] **Step 7: Run CLI lifecycle tests**
+Add:
 
-Run:
+```rust
+assert!(std::net::TcpStream::connect(("127.0.0.1", 0)).is_err());
+```
+
+On Unix:
+
+```rust
+assert_eq!(
+    std::fs::metadata(arbiter_home.join("control-token"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o177,
+    0,
+);
+```
+
+On Windows, extend the existing private-file ACL test path rather than introducing another PowerShell/ACL implementation.
+
+- [ ] **Step 7: Run tests**
 
 ```bash
 cargo test -p arbiter-cli --test lifecycle
 cargo test -p arbiter-cli m0_cli_exposes_only_codex_as_an_init_target
 ```
-
-Expected: schema-v2 tests pass; tests that encoded the old persisted installation port are rewritten to the new listener-derived model, not silently deleted without replacement coverage.
 
 - [ ] **Step 8: Commit**
 
@@ -443,19 +614,18 @@ git commit -m "feat: initialize m0 runtime identity separately"
 ### Task 4: Make Codex endpoint publication and receipt updates compensating
 
 **Files:**
-- Modify: `crates/arbiter-adapter-codex/src/profile.rs`
-- Modify: `crates/arbiter-adapter-codex/src/lib.rs`
+- Modify: `crates/arbiter-adapter-codex/src/profile.rs`, `lib.rs`
 - Create: `crates/arbiter-cli/src/commands/endpoint.rs`
 - Modify: `crates/arbiter-cli/src/commands/mod.rs`
 
 **Interfaces:**
 - Produces: `AppliedEndpointUpdate` with `updated_receipt()` and `rollback()`.
 - Produces: `update_managed_endpoint(config_path, receipt, port) -> Result<AppliedEndpointUpdate, CodexProfileError>`.
-- Produces: `endpoint::publish(paths, port) -> anyhow::Result<InstallReceipt>` as the only CLI path that mutates the runtime `base_url` and installed receipt hash.
+- Produces: `endpoint::publish(paths, port) -> anyhow::Result<InstallReceipt>` as the only CLI path that mutates runtime `base_url` and current installed receipt hash.
 
-- [ ] **Step 1: Write failing adapter tests for endpoint-only mutation**
+- [ ] **Step 1: Write failing adapter tests**
 
-Add tests in `profile.rs` proving all of the following:
+Exercise:
 
 ```rust
 let update = update_managed_endpoint(&config, &receipt, 45_678).unwrap();
@@ -465,13 +635,11 @@ assert_eq!(update.updated_receipt().config.original_sha256, receipt.config.origi
 assert_eq!(update.updated_receipt().profile, receipt.profile);
 ```
 
-Also assert unrelated original Codex keys and all Arbiter provider fields other than `base_url` are unchanged.
+Capture the original file string before update and assert unrelated user keys plus all provider fields other than `base_url` are identical after parsing both documents.
 
-Add a rollback test that applies an endpoint update then calls `rollback()` and verifies exact previous bytes and permissions.
+Add a rollback test: apply update, call `rollback()`, then assert exact previous bytes and permissions.
 
 - [ ] **Step 2: Implement `AppliedEndpointUpdate`**
-
-Keep rollback state private to the adapter:
 
 ```rust
 pub struct AppliedEndpointUpdate {
@@ -480,59 +648,68 @@ pub struct AppliedEndpointUpdate {
     previous_permissions: OriginalPermissions,
     config_path: PathBuf,
 }
+
+impl AppliedEndpointUpdate {
+    pub fn updated_receipt(&self) -> &InstallReceipt {
+        &self.updated_receipt
+    }
+
+    pub fn rollback(self) -> Result<(), CodexProfileError> {
+        atomic_replace_with_permissions(
+            &self.config_path,
+            &self.previous_config,
+            &self.previous_permissions,
+        )?;
+        Ok(())
+    }
+}
 ```
 
-Expose only:
+Implement a custom redacted `Debug` or no `Debug`; never expose previous config bytes in diagnostics.
 
-```rust
-pub fn updated_receipt(&self) -> &InstallReceipt;
-pub fn rollback(self) -> Result<(), CodexProfileError>;
-```
-
-`Debug` must not print file contents.
-
-- [ ] **Step 3: Implement `update_managed_endpoint` with conflict checking**
+- [ ] **Step 3: Implement `update_managed_endpoint` conflict checks**
 
 Before mutation:
 
-1. verify current config hash equals `receipt.config.installed_sha256`;
-2. verify the managed profile still equals `receipt.profile.installed_sha256`;
+1. current config hash must equal `receipt.config.installed_sha256`;
+2. current profile hash must equal `receipt.profile.installed_sha256`;
 3. parse current config;
-4. verify the managed provider has fixed M0 name, wire API, auth, retry settings, and loopback base URL shape;
+4. verify fixed M0 name, `wire_api`, auth and retry fields and a loopback `base_url`;
 5. change only `model_providers.arbiter.base_url` to `http://127.0.0.1:{port}/v1`;
-6. atomically replace the config with current private permissions;
-7. clone the receipt and update only `config.installed_sha256`.
+6. atomically replace config with current private permissions;
+7. clone receipt and update only `config.installed_sha256`.
 
-Do not modify `original_sha256`, backup paths, original permissions, or profile receipt.
+Do not modify immutable original hashes/backups/permissions or profile receipt.
 
-- [ ] **Step 4: Add the CLI coordinator and inject receipt-write failure in tests**
-
-Create `commands/endpoint.rs` with an internal generic writer so compensation is testable:
+- [ ] **Step 4: Add the CLI coordinator with injectable receipt writer**
 
 ```rust
-fn publish_with_writer<F>(paths: &Paths, port: u16, write_receipt: F) -> anyhow::Result<InstallReceipt>
+fn publish_with_writer<F>(
+    paths: &Paths,
+    port: u16,
+    write_receipt: F,
+) -> anyhow::Result<InstallReceipt>
 where
     F: FnOnce(&Path, &InstallReceipt) -> anyhow::Result<()>,
 ```
 
-Production `publish(paths, port)` passes a closure using `write_json_atomic`.
-
-If receipt persistence fails:
+Production `publish` passes `write_json_atomic`. On receipt-write failure:
 
 ```rust
+let receipt_error = write_receipt(&paths.receipt, update.updated_receipt()).unwrap_err();
 match update.rollback() {
-    Ok(()) => return Err(receipt_error).context("persist endpoint receipt"),
+    Ok(()) => Err(receipt_error).context("persist endpoint receipt"),
     Err(rollback_error) => anyhow::bail!(
         "endpoint receipt persistence failed and Codex config rollback failed: {receipt_error}; rollback: {rollback_error}"
     ),
 }
 ```
 
-The test writer deliberately returns `std::io::Error::other("injected receipt failure")`; assert the Codex config is byte-for-byte restored and the on-disk receipt remains the previous one.
+The unit test injects `Err(std::io::Error::other("injected receipt failure").into())`, then asserts Codex config bytes and on-disk receipt are unchanged.
 
-- [ ] **Step 5: Prove updated receipts still uninstall exactly**
+- [ ] **Step 5: Prove latest receipt still restores the immutable original**
 
-Add an adapter test sequence:
+Test sequence:
 
 ```text
 original config/profile
@@ -540,20 +717,17 @@ original config/profile
 → update endpoint 45678
 → persist/use updated receipt
 → update endpoint 0
+→ persist/use updated receipt
 → uninstall with latest receipt
 → exact original bytes + existence + permissions
 ```
 
-- [ ] **Step 6: Run focused adapter/CLI tests**
-
-Run:
+- [ ] **Step 6: Run tests**
 
 ```bash
 cargo test -p arbiter-adapter-codex profile
 cargo test -p arbiter-cli endpoint
 ```
-
-Expected: endpoint-only mutation, compensation, conflict refusal, and exact uninstall all pass.
 
 - [ ] **Step 7: Commit**
 
@@ -564,24 +738,22 @@ git commit -m "fix: make runtime endpoint publication atomic"
 
 ---
 
-### Task 5: Bind first, publish second, and depublish while admission is closed
+### Task 5: Bind first, publish second, and depublish after admission closes
 
 **Files:**
-- Modify: `crates/arbiter-daemon/src/app.rs`
-- Modify: `crates/arbiter-daemon/src/lib.rs`
-- Modify: `crates/arbiter-daemon/src/main.rs`
+- Modify: `crates/arbiter-daemon/src/app.rs`, `lib.rs`, `main.rs`
 - Modify: `crates/arbiter-daemon/tests/shutdown.rs`
 - Modify: `crates/arbiter-cli/src/commands/start.rs`
 - Modify: `crates/arbiter-cli/tests/lifecycle.rs`
 
 **Interfaces:**
 - Produces: `serve_listener_with_shutdown_hook(state, listener, shutdown, grace, on_admission_closed)`.
-- Keeps: existing `serve_listener_with_shutdown(...)` as a no-op-hook wrapper for current tests/consumers.
-- `start --foreground` derives `metadata.port` from `listener.local_addr()` and generates a fresh `instance_id` per start.
+- Keeps: `serve_listener_with_shutdown(...)` as a no-op-hook wrapper.
+- `start --foreground` derives `metadata.port` from `listener.local_addr()` and generates fresh `instance_id` per start.
 
-- [ ] **Step 1: Write failing lifecycle tests for listener-derived runtime identity**
+- [ ] **Step 1: Add failing listener-derived lifecycle tests**
 
-Rewrite lifecycle helpers so they read `server.json` after start instead of expecting the init-time port. Add tests that prove:
+Change lifecycle helpers to read `server.json` after start. For two separate starts around a clean stop, assert:
 
 ```rust
 assert!(first.port > 0);
@@ -589,13 +761,9 @@ assert!(second.port > 0);
 assert_ne!(first.instance_id, second.instance_id);
 ```
 
-Do not assert mathematical port inequality because an OS may eventually reuse an ephemeral port. Instead inspect the initialized config and assert there is no persisted port authority, and assert each foreground start binds port `0` before deriving the actual `server.json` port.
+Do not require port inequality. Assert schema-v2 config contains neither port nor instance ID. Add a failure test using an injectable endpoint writer in `start` so publication failure after listener bind leaves no READY `server.json` and leaves/restores managed endpoint port zero.
 
-Add a failure-path test where publication is injected to fail after listener bind; assert no READY metadata is published and the managed provider remains/restores to inactive port zero.
-
-- [ ] **Step 2: Add a shutdown hook after admission closes**
-
-Implement:
+- [ ] **Step 2: Add the bounded shutdown hook**
 
 ```rust
 pub async fn serve_listener_with_shutdown_hook<F, H>(
@@ -610,21 +778,11 @@ where
     H: Future<Output = ()> + Send + 'static,
 ```
 
-On shutdown signal:
+On shutdown: compute the one existing deadline, call `state.begin_shutdown()`, await the hook within that same deadline, then signal Axum graceful shutdown and preserve current drain/force-cancel/persistence/SQLite-close behavior. On hook timeout log only `shutdown_phase = "endpoint_depublication"`.
 
-1. compute the single existing process-wide deadline;
-2. call `state.begin_shutdown()` first;
-3. await `on_admission_closed` within that same deadline;
-4. signal Axum graceful shutdown;
-5. retain existing drain/force-cancel/persistence/SQLite-close behavior.
+Existing `serve_listener_with_shutdown` delegates with `std::future::ready(())`.
 
-If the hook exhausts the deadline, log only `shutdown_phase = "endpoint_depublication"`; do not log path contents or credentials.
-
-Keep `serve_listener_with_shutdown` delegating to this function with `std::future::ready(())`.
-
-- [ ] **Step 3: Make foreground start bind `127.0.0.1:0` before publication**
-
-In `start::run_foreground` perform this exact order:
+- [ ] **Step 3: Reorder foreground startup exactly**
 
 ```text
 TcpListener::bind(local_bind_address(0))
@@ -636,47 +794,43 @@ TcpListener::bind(local_bind_address(0))
 → generate fresh instance_id
 → endpoint::publish(paths, bound_port)
 → write server.json
-→ construct AppState with exact identity + control token
+→ construct AppState(identity + control token)
 → serve
 ```
 
-No profile mutation may occur before listener + DB ownership.
+No profile mutation before listener + DB ownership.
 
-- [ ] **Step 4: Compensate startup failure after endpoint publication**
+- [ ] **Step 4: Compensate startup failure after publication**
 
-If `server.json` persistence or AppState/server setup fails after publishing the active endpoint, call `endpoint::publish(paths, 0)` before returning the error. If that compensation also fails, report both failures and never print a READY/success message.
+If `server.json` persistence or later server setup fails after active publication, call `endpoint::publish(paths, 0)` before returning. If compensation fails, preserve both error causes and never emit READY/success.
 
-- [ ] **Step 5: Depublish on every controlled shutdown**
+- [ ] **Step 5: Depublish on controlled shutdown**
 
-Pass an `on_admission_closed` future that runs:
+Pass:
 
 ```rust
-if let Err(error) = endpoint::publish(&shutdown_paths, 0) {
-    tracing::error!(
-        event_type = "endpoint_depublication_failed",
-        "Arbiter failed to depublish its managed endpoint during shutdown"
-    );
-}
+let on_admission_closed = async move {
+    if endpoint::publish(&shutdown_paths, 0).is_err() {
+        tracing::error!(
+            event_type = "endpoint_depublication_failed",
+            "Arbiter failed to depublish its managed endpoint during shutdown"
+        );
+    }
+};
 ```
 
-Do not format `error` into structured logs if it can contain filesystem paths. CLI stderr may report the high-level failure separately when appropriate.
+Do not log error text that can contain local paths. Remove `server.json` after serve returns only when it still equals the identity owned by this process.
 
-After the server finishes, remove `server.json` only if identity still matches the process that owned it.
+- [ ] **Step 6: Update standalone daemon**
 
-- [ ] **Step 6: Update standalone `arbiter-daemon` semantics**
+`arbiter-daemon` defaults `--port` to `0`, derives real identity port from the bound listener, adds required `--control-token-file`, reads/validates it, and passes the token to `AppState`. It does not publish Codex config.
 
-Change standalone daemon default `--port` to `0`, derive the real identity port from `listener.local_addr()`, and add a required `--control-token-file` argument. Read/validate the token before serving. The standalone binary does not publish Codex config; document it as a low-level operator/test path.
-
-- [ ] **Step 7: Run lifecycle and shutdown regressions**
-
-Run:
+- [ ] **Step 7: Run regressions**
 
 ```bash
 cargo test -p arbiter-daemon --test shutdown
 cargo test -p arbiter-cli --test lifecycle
 ```
-
-Expected: shutdown still honors one bounded deadline, admission closes before depublication, listener-derived runtime identity is used, and failed startup never leaves a newly published unowned endpoint.
 
 - [ ] **Step 8: Commit**
 
@@ -690,99 +844,63 @@ git commit -m "fix: publish only owned daemon endpoints"
 ### Task 6: Move status, doctor, and uninstall ownership checks to the control channel
 
 **Files:**
-- Modify: `crates/arbiter-cli/src/commands/control.rs`
-- Modify: `crates/arbiter-cli/src/commands/status.rs`
-- Modify: `crates/arbiter-cli/src/commands/doctor.rs`
-- Modify: `crates/arbiter-cli/src/commands/uninstall.rs`
+- Modify: `crates/arbiter-cli/src/commands/control.rs`, `status.rs`, `doctor.rs`, `uninstall.rs`
 - Modify: `crates/arbiter-cli/tests/lifecycle.rs`
 - Modify: `crates/arbiter-daemon/tests/privacy.rs`
 
 **Interfaces:**
 - Produces: `control::identity_at(port, token) -> Option<DaemonIdentity>`.
-- Produces: `control::current_identity(paths) -> anyhow::Result<Option<DaemonIdentity>>`, which requires both `server.json` and a matching authenticated control response.
+- Produces: `control::current_identity(paths) -> anyhow::Result<Option<DaemonIdentity>>` requiring `server.json` plus exact authenticated response.
 - Public `/healthz` is never used to establish ownership.
 
-- [ ] **Step 1: Add failing control-client lifecycle tests**
+- [ ] **Step 1: Extend fake-server tests for control semantics**
 
-Extend the fake local HTTP server used by lifecycle tests so it can distinguish `/healthz` from `/control/identity` and inspect the control header. Add cases:
+Teach the lifecycle fake server to parse the request line and `X-Arbiter-Control-Token`. Add four cases:
 
-- generic `200 /healthz` cannot satisfy `status`, `doctor`, `start`, or `uninstall` ownership;
-- `/control/identity` without the expected token returns/acts as 404 and is rejected;
-- wrong identity with a valid token is rejected;
-- exact authenticated identity is accepted.
+1. generic `200 /healthz` cannot satisfy start/status/doctor/uninstall ownership;
+2. `/control/identity` without expected token is rejected;
+3. valid token with mismatched identity is rejected;
+4. valid token with exact identity is accepted.
 
-Retain the existing “unrecognized process” refusal behavior when a stale metadata port is occupied by another process.
+Retain refusal when stale metadata points to another responding process.
 
 - [ ] **Step 2: Implement authenticated identity lookup**
 
-In `commands/control.rs`, build a Reqwest client with the existing short local timeout and send:
+`identity_at` builds a short-timeout Reqwest client, constructs a `HeaderValue` from `token.expose()`, calls `set_sensitive(true)`, and sends:
 
 ```text
 GET http://127.0.0.1:{port}/control/identity
 X-Arbiter-Control-Token: <token>
 ```
 
-Construct the `HeaderValue` separately and call `set_sensitive(true)` before inserting it. Return `None` on non-success, invalid JSON, timeout, or identity mismatch; never include the token in error strings.
+Return `None` on timeout, non-2xx, invalid JSON, or decode failure; no token appears in an error string.
 
-`current_identity(paths)` must:
+`current_identity(paths)`:
 
-1. return `Ok(None)` if `server.json` is absent;
-2. read `ServerMetadata`;
-3. read the owner-only control token;
-4. query `metadata.port`;
-5. return the identity only when the authenticated response equals metadata exactly.
+```text
+server.json absent → Ok(None)
+server.json present → read metadata → read control token → query metadata.port
+authenticated response == metadata → Ok(Some(metadata))
+anything else → Ok(None)
+```
 
-- [ ] **Step 3: Rewrite `status` around runtime metadata, not config port**
+- [ ] **Step 3: Rewrite `status` around runtime metadata**
 
-`status` still reports PASSTHROUGH, Terra/Medium, storage integrity, profile state, provider reachability, and attempt counts. Daemon state becomes:
+Report healthy only for exact authenticated identity. Report stopped only when no runtime metadata exists and managed provider validates at port zero. If stale metadata port responds without valid control identity, return an unrecognized-process error. Validate managed profile against authenticated runtime port when healthy and port zero when stopped.
 
-- `healthy` only for exact authenticated control identity;
-- `stopped` when no server metadata and managed endpoint is inactive port zero;
-- error/unrecognized when stale metadata points to a responding but unauthenticated process.
+- [ ] **Step 4: Rewrite `doctor` with the same contract**
 
-When healthy, validate the managed Codex profile against the authenticated identity port. When stopped, validate against port zero.
-
-- [ ] **Step 4: Rewrite `doctor` with the same ownership contract**
-
-`doctor` must validate:
-
-- schema-v2 local PASSTHROUGH config;
-- owner-only control token exists and parses;
-- SQLite integrity;
-- managed profile equals active authenticated port when running or inactive port zero when stopped;
-- loopback bind remains enforced;
-- Codex reports ChatGPT authentication;
-- remote export remains disabled.
-
-It must not print the control token or full private identity.
+Validate schema-v2 config, private control token, SQLite integrity, profile active-port-or-zero state, loopback bind, ChatGPT authentication, and remote export disabled. Do not print token or full private identity.
 
 - [ ] **Step 5: Rewrite uninstall stop logic**
 
-If `server.json` is absent, uninstall does not probe a historical configured port because config no longer has one. It proceeds to exact receipt-based restoration.
-
-If `server.json` exists:
-
-- authenticate exact control identity;
-- if exact, create the existing private stop marker and wait for owned metadata removal;
-- if identity fails and the metadata port is responding, refuse as unrecognized;
-- if identity fails and the metadata port is not responding, treat metadata as stale, remove only that stale metadata, and continue exact receipt restoration.
-
-After successful restoration remove `control-token`, `receipt`, `config`, stale stop/server metadata, but preserve `arbiter.db` and immutable backups.
+If `server.json` is absent, restore from receipt without probing a historical config port. If present: exact control identity → stop owned daemon; failed identity + responding metadata port → refuse; failed identity + nonresponding port → remove stale metadata and continue exact restoration. On successful uninstall remove control token/config/receipt/stop/server files while preserving `arbiter.db` and backups.
 
 - [ ] **Step 6: Add control-secret privacy regression**
 
-In `crates/arbiter-daemon/tests/privacy.rs` and lifecycle tests:
+Read the generated token, perform init/start/status/doctor/synthetic proxy/uninstall, and assert exact token bytes are absent from Codex config/profile, SQLite/WAL/SHM, captured daemon logs, config/receipt/server metadata. The token is allowed only in `$ARBITER_HOME/control-token` while installed and that file must be gone after uninstall.
 
-1. read the generated token from `$ARBITER_HOME/control-token`;
-2. perform init/start/status/doctor/one synthetic proxy call/uninstall;
-3. scan Codex config/profile, SQLite, WAL, SHM, captured daemon logs, config/receipt/server metadata;
-4. assert the exact token bytes occur only in the designated `control-token` file while installed and nowhere after successful uninstall.
-
-Do not scan the token file and then claim “no occurrence”; explicitly exclude that single authorized storage location.
-
-- [ ] **Step 7: Run full deterministic workspace tests locally**
-
-Run:
+- [ ] **Step 7: Run deterministic workspace checks**
 
 ```bash
 cargo fmt --all -- --check
@@ -790,8 +908,6 @@ cargo check --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features
 ```
-
-Expected: all deterministic tests pass; live contract tests remain ignored by default.
 
 - [ ] **Step 8: Commit**
 
@@ -807,15 +923,13 @@ git commit -m "security: authenticate arbiter lifecycle control"
 **Files:**
 - Modify: `rust-toolchain.toml`
 - Create: `.github/workflows/ci.yml`
-- Modify if required by the newer audit tool: `deny.toml`
+- Modify only if syntax compatibility requires it: `deny.toml`
 
 **Interfaces:**
-- Produces two required CI job names: `linux` and `windows`.
-- CI requires only `contents: read` and no secrets.
+- Produces required CI jobs `linux` and `windows`.
+- CI uses only `contents: read`; no secrets.
 
-- [ ] **Step 1: Pin the Rust toolchain used by release evidence**
-
-Change `rust-toolchain.toml` to:
+- [ ] **Step 1: Pin repository execution toolchain**
 
 ```toml
 [toolchain]
@@ -824,11 +938,9 @@ components = ["clippy", "rustfmt"]
 profile = "minimal"
 ```
 
-Keep `[workspace.package].rust-version = "1.85"` unchanged; it describes package MSRV intent, while the repository execution toolchain is pinned for reproducible CI/release evidence.
+Keep workspace `rust-version = "1.85"` unchanged as package MSRV intent.
 
-- [ ] **Step 2: Create the least-privilege workflow**
-
-Create `.github/workflows/ci.yml`:
+- [ ] **Step 2: Create `.github/workflows/ci.yml`**
 
 ```yaml
 name: CI
@@ -879,61 +991,53 @@ jobs:
         run: cargo test --workspace --all-targets --all-features
 ```
 
-Do not add caching, artifact upload, OpenAI secrets, ChatGPT state, or write permissions in this remediation.
+Do not add caching, artifacts, OpenAI/ChatGPT secrets, or write permissions.
 
-- [ ] **Step 3: Verify cargo-deny 0.20.2 against current policy locally**
-
-Run:
+- [ ] **Step 3: Validate cargo-deny 0.20.2 locally**
 
 ```bash
 cargo install cargo-deny --version 0.20.2 --locked
 cargo deny check
 ```
 
-If `deny.toml` syntax has changed, make only syntax-equivalent changes needed for 0.20.2; do not weaken advisories, bans, licenses, or sources policy to obtain green output.
+If `deny.toml` syntax needs adjustment for 0.20.2, preserve the existing advisory/ban/license/source policy semantics; never weaken policy to get green output.
 
-- [ ] **Step 4: Validate workflow syntax and no-secret policy by inspection**
-
-Check:
+- [ ] **Step 4: Inspect workflow security**
 
 ```bash
 git diff --check
-rg -n "OPENAI_API_KEY|CHATGPT|secrets\.|contents: write|pull-requests: write|actions/upload-artifact" .github/workflows/ci.yml
+rg -n "OPENAI_API_KEY|secrets\.|contents: write|pull-requests: write|actions/upload-artifact" .github/workflows/ci.yml
 ```
 
-Expected: `rg` finds no secret or write/artifact configuration; only the workflow’s ordinary text should remain.
+Expected: no matches for secret/write/artifact configuration.
 
-- [ ] **Step 5: Push implementation branch and require fresh CI evidence**
+- [ ] **Step 5: Require fresh GitHub evidence**
 
-On the implementation PR, wait for both `linux` and `windows` jobs to complete successfully. A local green test suite is not a substitute for this step.
+Push the implementation branch and require both `linux` and `windows` jobs green. Local tests do not substitute for this gate.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add rust-toolchain.toml .github/workflows/ci.yml deny.toml
+git add rust-toolchain.toml .github/workflows/ci.yml
+git add deny.toml 2>/dev/null || true
 git commit -m "ci: verify arbiter m0 on linux and windows"
 ```
 
-If `deny.toml` did not change, omit it from `git add`.
+Only stage `deny.toml` if it actually changed.
 
 ---
 
 ### Task 8: Re-run live, privacy, performance, and independent review gates
 
 **Files:**
-- Modify: `docs/m0/contract-gates.md`
-- Modify: `docs/m0/operations.md`
-- Modify: `docs/m0/performance.md`
-- Modify: `docs/m0/release-checklist.md`
+- Modify: `docs/m0/contract-gates.md`, `operations.md`, `performance.md`, `release-checklist.md`
 - Create: `docs/m0/neurovia-dogfooding.md`
 
 **Interfaces:**
-- Produces the release decision `GO FOR DAILY NEUROVIA DOGFOODING` only if every gate below has fresh evidence.
+- Produces `GO FOR DAILY NEUROVIA DOGFOODING` only if every gate has fresh evidence.
 - Does not change runtime behavior.
 
-- [ ] **Step 1: Run the complete deterministic release suite on the implementation head**
-
-Run:
+- [ ] **Step 1: Run complete deterministic release suite**
 
 ```bash
 cargo fmt --all -- --check
@@ -945,27 +1049,20 @@ cargo deny check
 git diff --check
 ```
 
-Record the exact commit SHA and test counts in `docs/m0/release-checklist.md`. Do not reuse the prior `dfaa349...` evidence.
+Record exact implementation commit SHA and actual debug/release test counts in `release-checklist.md`; do not reuse prior `dfaa349...` evidence.
 
-- [ ] **Step 2: Run the ignored live Codex contract suite with ChatGPT-managed auth**
-
-Confirm first:
+- [ ] **Step 2: Run ignored live Codex contract suite**
 
 ```bash
 codex login status
-```
-
-The report must identify ChatGPT authentication. Then run with `OPENAI_API_KEY` removed from the child environment:
-
-```bash
 cargo test -p arbiter-cli --test contract -- --ignored --test-threads=1
 ```
 
-The suite must prove direct and through-Arbiter Responses streaming, usage extraction, cancellation, metadata-only persistence, and exact restoration using the new bind-first profile lifecycle.
+ChatGPT-managed authentication is required and `OPENAI_API_KEY` must be removed from the child environment. The suite must prove direct and through-Arbiter streaming, usage extraction, cancellation, metadata-only persistence, and exact restoration with the new bind-first lifecycle.
 
-- [ ] **Step 3: Run a manual NeuroVia-shaped smoke without making Arbiter default**
+- [ ] **Step 3: Run a NeuroVia-shaped manual smoke without changing default Codex profile**
 
-From a NeuroVia checkout:
+From the NeuroVia checkout:
 
 ```bash
 arbiter init codex --yes
@@ -976,30 +1073,15 @@ arbiter status
 arbiter uninstall --yes
 ```
 
-Verify the output is exactly `arbiter-dogfood-ok`, status reports a healthy daemon during the run, and uninstall restores the pre-run Codex files exactly. Do not persist repository content into Arbiter evidence.
+Expected response: exactly `arbiter-dogfood-ok`; running status healthy; uninstall restores pre-run Codex files exactly.
 
-- [ ] **Step 4: Re-run privacy sentinel checks**
+- [ ] **Step 4: Re-run privacy sentinels**
 
-Use synthetic sentinels for prompt/source/auth/control values. Verify no sentinel exists in:
+Use synthetic prompt/source/auth/control sentinels and verify none appears in `arbiter.db`, WAL, SHM, config, receipt, server metadata, Codex config/profile, or captured structured logs. The control token is allowed only in `control-token` while installed and is removed by uninstall.
 
-```text
-arbiter.db
-arbiter.db-wal
-arbiter.db-shm
-config.json
-install-receipt.json
-server.json
-Codex config/profile
-captured structured logs
-```
+- [ ] **Step 5: Re-run the 1,000-pair benchmark**
 
-The only allowed location for the control credential before uninstall is `$ARBITER_HOME/control-token`; after uninstall it must be removed.
-
-- [ ] **Step 5: Re-run the 1,000-pair release benchmark**
-
-Use the existing benchmark binary/procedure with 50 warmups and 1,000 paired direct/proxy samples. Record first-byte and total added latency p50/p95/p99 in `docs/m0/performance.md`.
-
-Release passes only if added local latency remains:
+Use the existing release benchmark with 50 warmups and 1,000 paired direct/proxy samples. Record first-byte and total added latency p50/p95/p99 in `performance.md`. Pass only if:
 
 ```text
 p50 < 10 ms
@@ -1007,11 +1089,9 @@ p95 < 25 ms
 p99 < 50 ms
 ```
 
-Do not relax the gate because of the remediation.
+- [ ] **Step 6: Update operations documentation**
 
-- [ ] **Step 6: Update operational documentation with the new lifecycle**
-
-`docs/m0/operations.md` must show:
+Document exactly:
 
 ```text
 init → inactive port 0
@@ -1022,11 +1102,9 @@ shutdown → close admission → depublish to port 0 → bounded cleanup
 uninstall → exact original restoration + preserve arbiter.db
 ```
 
-Document that the localhost inference endpoint is not cryptographically server-pinned and that hostile multi-user enterprise hardening is deferred.
+State explicitly that localhost inference is not cryptographically server-pinned and hostile multi-user enterprise hardening is deferred.
 
-- [ ] **Step 7: Add NeuroVia dogfooding runbook**
-
-Create `docs/m0/neurovia-dogfooding.md` with these operating rules:
+- [ ] **Step 7: Add `docs/m0/neurovia-dogfooding.md`**
 
 ```markdown
 # NeuroVia Dogfooding — Arbiter M0
@@ -1039,35 +1117,33 @@ Create `docs/m0/neurovia-dogfooding.md` with these operating rules:
 - Use `arbiter uninstall --yes` as the rollback path; event history remains local.
 ```
 
-Include the exact init/start/status/uninstall commands and the accepted localhost residual risk.
+Include exact init/start/status/uninstall commands and accepted localhost residual risk.
 
-- [ ] **Step 8: Run independent engineering and security reviews**
+- [ ] **Step 8: Run independent Engineering Guardrails and Security reviews**
 
-Run a fresh Codex Engineering Guardrails verification against the final implementation commit and a fresh Codex Security standard scan scoped to the repository. Required outcome:
+Run a fresh Codex Engineering Guardrails verification against the final implementation commit and a fresh Codex Security standard repository scan. Required outcome:
 
 ```text
 no blocking correctness finding
 no blocking security finding within the approved M0 threat model
 ```
 
-Any validated blocker reopens the remediation; do not mark the release checklist PASS around it.
+Any validated blocker reopens remediation.
 
-- [ ] **Step 9: Verify GitHub CI on the exact final commit**
+- [ ] **Step 9: Verify CI on the exact final SHA**
 
-Confirm both GitHub Actions jobs are green on the final commit after all code/doc changes. If documentation-only changes follow a green run, the final push must still produce fresh CI status for that SHA.
+Both GitHub Actions jobs must be green on the final commit after all code/documentation changes.
 
 - [ ] **Step 10: Close the release checklist and commit evidence**
 
-Update `docs/m0/release-checklist.md` decision from the old M0 release wording to:
+Set decision text to:
 
 ```text
 PASS — M0 dogfooding-readiness remediation gate is closed.
 GO FOR DAILY NEUROVIA DOGFOODING under the documented personal-workstation threat model.
 ```
 
-Keep an explicit sentence that this is not M1 and not enterprise hostile-host hardening.
-
-Commit:
+Keep explicit text that this is neither M1 nor enterprise hostile-host hardening.
 
 ```bash
 git add docs/m0
@@ -1077,8 +1153,6 @@ git commit -m "docs: close m0 dogfooding readiness gate"
 ---
 
 ## Final Verification Matrix
-
-Before merge/release, map fresh evidence to every approved acceptance criterion:
 
 | Acceptance criterion | Primary evidence |
 | --- | --- |
@@ -1091,7 +1165,7 @@ Before merge/release, map fresh evidence to every approved acceptance criterion:
 | CLI ownership uses control credential | lifecycle fake-server tests |
 | Control secret owner-only/private | lifecycle + platform permission tests |
 | Control secret never forwarded/persisted/logged | provider + privacy tests |
-| Recovery after listener + DB ownership | existing + updated start recovery tests |
+| Recovery after listener + DB ownership | existing + updated recovery tests |
 | Exact uninstall after changing runtime endpoint | adapter transition + lifecycle tests |
 | Linux CI gate | GitHub Actions `linux` job |
 | Windows ACL CI gate | GitHub Actions `windows` job |
@@ -1107,7 +1181,7 @@ Before merge/release, map fresh evidence to every approved acceptance criterion:
 
 - Execute in an isolated worktree created at implementation time with `superpowers:using-git-worktrees`.
 - Prefer `superpowers:subagent-driven-development`: one fresh implementer/reviewer cycle per task.
-- Use TDD in the order written; do not batch all tests at the end.
-- Do not start M1 work while this plan is open.
-- If implementation discovers that Codex changed its custom-provider contract, stop that task and re-run the live contract/Context7 verification before altering the approved architecture.
+- Use TDD in the written order; do not batch all tests at the end.
+- Do not start M1 while this plan is open.
+- If Codex changes its custom-provider contract during execution, stop that task and re-run live contract/Context7 verification before altering the approved architecture.
 - If a task requires weakening an existing safety/privacy assertion to pass, treat that as a finding rather than changing the assertion.
