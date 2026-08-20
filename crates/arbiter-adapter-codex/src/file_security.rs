@@ -102,7 +102,7 @@ pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
     #[cfg(windows)]
-    windows_acl::apply_sddl(path, &windows_acl::private_sddl()?)?;
+    windows_acl::apply_sddl(path, &windows_acl::private_directory_sddl()?)?;
     Ok(())
 }
 
@@ -245,6 +245,11 @@ mod windows_acl {
         Ok(format!("D:P(A;;FA;;;{sid})"))
     }
 
+    pub(super) fn private_directory_sddl() -> io::Result<String> {
+        let sid = current_process_sid()?;
+        Ok(format!("D:P(A;OICI;FA;;;{sid})"))
+    }
+
     pub(super) fn private_sddl_no_broader(original: Option<&str>) -> io::Result<String> {
         let Some(original) = original else {
             return private_sddl();
@@ -330,9 +335,10 @@ mod windows_tests {
         format!("{}{aces}", control.replace("AI", ""))
     }
 
-    fn has_single_protected_full_control_ace(sddl: &str) -> bool {
+    fn has_single_protected_full_control_ace(sddl: &str, inheritance: &str) -> bool {
         let dacl = normalized_dacl(sddl);
-        let Some(dacl) = dacl.strip_prefix("D:P(A;;FA;;;") else {
+        let expected = format!("D:P(A;{inheritance};FA;;;");
+        let Some(dacl) = dacl.strip_prefix(&expected) else {
             return false;
         };
         let Some((principal, remainder)) = dacl.split_once(')') else {
@@ -356,11 +362,11 @@ mod windows_tests {
         assert!(directory_sddl.contains("D:P"));
         assert!(file_sddl.contains("D:P"));
         assert!(
-            has_single_protected_full_control_ace(&directory_sddl),
+            has_single_protected_full_control_ace(&directory_sddl, "OICI"),
             "unexpected private directory DACL: {directory_sddl}"
         );
         assert!(
-            has_single_protected_full_control_ace(&file_sddl),
+            has_single_protected_full_control_ace(&file_sddl, ""),
             "unexpected private file DACL: {file_sddl}"
         );
     }
