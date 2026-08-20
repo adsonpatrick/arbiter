@@ -204,7 +204,7 @@ pub fn harden_private_file(path: &Path) -> io::Result<()> {
 mod windows_acl {
     use std::{ffi::OsStr, io, path::Path, process::Command};
 
-    pub(super) fn run(script: &str, environment: &[(&str, &OsStr)]) -> io::Result<String> {
+    fn run(script: &str, environment: &[(&str, &OsStr)]) -> io::Result<String> {
         let system_root = std::env::var_os("SystemRoot")
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SystemRoot is unavailable"))?;
         let executable = Path::new(&system_root)
@@ -293,8 +293,6 @@ mod windows_acl {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use std::ffi::OsStr;
-
     use tempfile::tempdir;
 
     use super::{
@@ -302,21 +300,25 @@ mod windows_tests {
         harden_private_file, windows_acl,
     };
 
-    fn dacl_fingerprint(sddl: &str) -> String {
-        windows_acl::run(
-            "& { $acl = [Security.AccessControl.FileSecurity]::new(); $acl.SetSecurityDescriptorSddlForm($env:ARBITER_ACL_SDDL); $rules = foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) { '{0}|{1}|{2}|{3}|{4}|{5}' -f $rule.IdentityReference.Value, $rule.AccessControlType, [long]$rule.FileSystemRights, $rule.InheritanceFlags, $rule.PropagationFlags, $rule.IsInherited }; [Array]::Sort($rules); [Console]::Out.Write(('{0};{1}' -f $acl.AreAccessRulesProtected, ($rules -join ';'))) }",
-            &[("ARBITER_ACL_SDDL", OsStr::new(sddl))],
-        )
-        .unwrap()
+    fn normalized_dacl(sddl: &str) -> String {
+        let start = sddl.find("D:").expect("SDDL must contain a DACL");
+        let dacl = &sddl[start..];
+        let end = dacl.find("S:").unwrap_or(dacl.len());
+        let dacl = &dacl[..end];
+        let first_ace = dacl.find('(').unwrap_or(dacl.len());
+        let (control, aces) = dacl.split_at(first_ace);
+        format!("{}{aces}", control.replace("AI", ""))
     }
 
-    fn grants_current_user_full_control(sddl: &str) -> bool {
-        windows_acl::run(
-            "& { $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $acl = [Security.AccessControl.FileSecurity]::new(); $acl.SetSecurityDescriptorSddlForm($env:ARBITER_ACL_SDDL); $match = $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -eq $identity.User.Value -and $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl }; [Console]::Out.Write([bool]$match) }",
-            &[("ARBITER_ACL_SDDL", OsStr::new(sddl))],
-        )
-        .unwrap()
-        .eq_ignore_ascii_case("true")
+    fn has_single_protected_full_control_ace(sddl: &str) -> bool {
+        let dacl = normalized_dacl(sddl);
+        let Some(dacl) = dacl.strip_prefix("D:P(A;;FA;;;") else {
+            return false;
+        };
+        let Some((principal, remainder)) = dacl.split_once(')') else {
+            return false;
+        };
+        !principal.is_empty() && !remainder.contains('(')
     }
 
     #[test]
@@ -333,8 +335,14 @@ mod windows_tests {
 
         assert!(directory_sddl.contains("D:P"));
         assert!(file_sddl.contains("D:P"));
-        assert!(grants_current_user_full_control(&directory_sddl));
-        assert!(grants_current_user_full_control(&file_sddl));
+        assert!(
+            has_single_protected_full_control_ace(&directory_sddl),
+            "unexpected private directory DACL: {directory_sddl}"
+        );
+        assert!(
+            has_single_protected_full_control_ace(&file_sddl),
+            "unexpected private file DACL: {file_sddl}"
+        );
     }
 
     #[test]
@@ -349,8 +357,8 @@ mod windows_tests {
 
         let restored = windows_acl::capture_dacl(&file).unwrap();
         assert_eq!(
-            dacl_fingerprint(&restored),
-            dacl_fingerprint(original.windows_sddl.as_deref().unwrap())
+            normalized_dacl(&restored),
+            normalized_dacl(original.windows_sddl.as_deref().unwrap())
         );
     }
 
