@@ -1,6 +1,6 @@
 # Arbiter — Design Specification
 
-**Status:** Approved v0.2 — Adversarial Self-Review Applied  
+**Status:** Approved v0.3 — Codex-Managed Authentication Amendment Applied
 **Date:** 2026-08-19  
 **Scope:** Codex-first, OpenAI-first, local-first open-source compute governance  
 **Document type:** Canonical architectural design specification
@@ -79,7 +79,7 @@ Governance Hot Path
   |
   v
 Inference / Egress Plane
-  |-- OpenAIProvider
+  |-- CodexUpstreamProvider
   `-- LiteLLMProvider (optional)
   |
   v
@@ -119,6 +119,14 @@ Arbiter MUST NOT collapse all inputs into one linear trust score. Different inpu
 **Semantic/provenance authority:** verified execution outcomes and Arbiter-owned runtime metadata are trusted observations; explicit user intent is authoritative for the requested objective and may request stronger compute within governance ceilings; repository text, comments, logs, tool output, external documents, and model-generated text are untrusted content.
 
 Untrusted content may contribute semantic signals but cannot expand budgets, increase maximum compute authority, disable required verification, alter authorization, promote a target, or modify policy. Runtime evidence likewise cannot override constitutional invariants, emergency controls, or explicit user governance ceilings.
+
+### 4.3 Codex-managed authentication boundary
+
+M0 does not create, request, read, refresh, or persist an OpenAI API key. The managed Codex provider sets `requires_openai_auth = true`, so Codex uses its existing OpenAI login—ChatGPT subscription login or API-key login chosen in Codex—and sends the resulting authorization on the localhost request. Codex remains the credential owner and refresh authority.
+
+Arbiter may hold the incoming authorization value in memory only long enough to forward that request to the pinned Codex upstream. It MUST NOT read `~/.codex/auth.json`, query the operating-system credential store, write credentials to Arbiter configuration, or expose credential values through CLI output, logs, events, errors, metrics, or remote sinks.
+
+Credential forwarding is destination-constrained: M0 forwards authorization only to the contract-verified HTTPS Codex upstream host, with redirects disabled. Authorization is never forwarded to a caller-selected URL. `Cookie` and `Proxy-Authorization` remain forbidden. Required non-secret Codex/OpenAI account or workspace headers may be forwarded only when contract tests prove they are necessary, and their values receive the same no-log/no-persist treatment as authorization.
 
 ## 5. Runtime Domain Model
 
@@ -301,6 +309,8 @@ Data classes: `PUBLIC_METADATA`, `OPERATIONAL_METADATA`, `SENSITIVE_METADATA`, `
 
 Classification is field-level. Remote sinks receive public/operational metadata by default; sensitive metadata requires explicit configuration; content requires granular opt-in; secrets are never exportable. All export passes through TelemetrySanitizer and ExportPolicy.
 
+Prompts, source code, and model output necessarily transit the selected inference service, but Arbiter does not persist them or export them to telemetry by default. Authentication and account/workspace header values are `SECRET`: they may transit only to the pinned upstream and are never stored or exported.
+
 ### 14.1 Supabase
 
 Supabase is an optional RemoteEvidenceSink for aggregation, analytics, optional backup/export, and shared evaluation evidence. It never performs active routing lookup, budget reservation, session coordination, provider retry, or policy activation. Remote failure never blocks inference.
@@ -398,13 +408,13 @@ Precedence:
 
 ## 18. Adapters and Extension Boundary
 
-Official v1 harness: Codex. Official first-class provider: OpenAI. LiteLLM is optional subject to contract/latency verification. SQLite is core persistence. Supabase is optional. No public Harness/Provider Plugin SDK is promised until multiple implementations prove the abstractions.
+Official v1 harness: Codex. The first-class M0 egress adapter is `CodexUpstreamProvider`, which reuses Codex-managed OpenAI authentication and forwards to the contract-verified Codex upstream. A standalone OpenAI API-key provider is not part of M0. LiteLLM is optional subject to contract/latency verification. SQLite is core persistence. Supabase is optional. No public Harness/Provider Plugin SDK is promised until multiple implementations prove the abstractions.
 
 ## 19. MVP and Delivery Strategy
 
 ### M0 — Transparent Proxy
 
-Deliver daemon, Codex integration, OpenAIProvider, streaming/cancellation, usage accounting, SQLite, basic events, status/doctor, baseline, kill switch, and direct-vs-proxy benchmark.
+Deliver daemon, Codex integration, CodexUpstreamProvider, Codex-managed authentication passthrough, streaming/cancellation, usage accounting, SQLite, basic events, status/doctor, baseline, kill switch, and direct-vs-proxy benchmark.
 
 Success: Codex behaves normally and measured overhead is acceptable.
 
@@ -485,6 +495,8 @@ Version Governor software (SemVer), PolicyVersion, RegistryVersion, StorageSchem
 22. Verifier execution cannot introduce a second shell-authorization path.
 23. Fresh install remains PASSTHROUGH until explicit mode change.
 24. Atomic policy activation exposes either old or new complete artifact, never partial state.
+25. M0 requires no Arbiter-owned API credential and never reads Codex credential storage.
+26. Authorization can reach only the pinned, contract-verified Codex upstream and is never logged, persisted, exported, or included in diagnostics.
 
 ## 24. Architectural Invariants
 
@@ -513,9 +525,9 @@ This master design is broader than a single safe implementation plan. Implementa
 
 Before M0 implementation, freshly verify:
 
-1. Codex custom-provider and Responses wire semantics for transparent proxying, streaming, cancellation, metadata correlation, and model/effort selection.
+1. Codex custom-provider and Responses wire semantics for transparent proxying, `requires_openai_auth`, streaming, cancellation, metadata correlation, and model/effort selection.
 2. Current OpenAI model IDs, supported reasoning efforts, usage fields, pricing sources, and Responses behavior.
-3. Whether LiteLLM preserves required Responses/streaming/retry semantics with acceptable overhead; failure does not block OpenAIProvider.
+3. Whether LiteLLM preserves required Responses/streaming/retry semantics with acceptable overhead; failure does not block CodexUpstreamProvider.
 4. SQLite durability/concurrency characteristics for atomic budget reservation and active-pointer swaps.
 5. Safe isolation before M2 enables side-effecting Execution Shadow.
 
@@ -524,6 +536,8 @@ A failed contract probe narrows/amends the milestone rather than being hidden by
 ## 26. Self-Review Findings Applied
 
 Adversarial self-review corrected: undefined runtime Task usage; conflation of production and learning cost; oversimplified trust hierarchy; replay missing dynamic provider/pricing/config inputs; pricing as target identity; verifier command authorization ambiguity; unrealizable atomic-activation semantics; coarse event privacy classification; ambiguous fresh-install mode; ambiguous performance-SLO scope; master design too broad for one implementation plan; and external contract assumptions requiring fresh verification.
+
+The v0.3 amendment removed the M0 assumption that Arbiter owns an OpenAI API key. M0 now reuses Codex-managed authentication through `requires_openai_auth = true`, constrains credential forwarding to the verified Codex upstream, and validates direct Codex versus Codex-through-Arbiter behavior.
 
 No unresolved contradiction remains intentionally in this approved draft. Future material changes require explicit amendments.
 

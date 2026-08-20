@@ -4,7 +4,7 @@
 
 **Goal:** Build the M0 transparent local proxy so Codex can use Arbiter through the Responses API with streaming/cancellation preserved, durable local event capture, health/status/doctor commands, safe Codex configuration rollback, and measurable proxy overhead while production always uses the approved Terra/Medium baseline.
 
-**Architecture:** M0 is a Rust Cargo workspace with a localhost-only Axum daemon, a Codex configuration adapter, a first-class OpenAI Responses passthrough provider, and SQLx/SQLite durable storage. The proxy accepts only the Responses-compatible surface required by Codex, forwards requests without semantic mutation, streams upstream bytes without full buffering, records privacy-minimized attempt metadata, and never performs adaptive routing in M0. LiteLLM is not in the M0 data path; a compatibility probe may be run only after direct OpenAI passthrough is green.
+**Architecture:** M0 is a Rust Cargo workspace with a localhost-only Axum daemon, a Codex configuration adapter, a first-class Codex upstream passthrough provider, and SQLx/SQLite durable storage. The managed provider uses `requires_openai_auth = true`, so Codex owns login and token refresh while Arbiter forwards authorization in memory only to the pinned, contract-verified HTTPS Codex upstream. The proxy accepts only the Responses-compatible surface required by Codex, forwards requests without semantic mutation, streams upstream bytes without full buffering, records privacy-minimized attempt metadata, and never performs adaptive routing in M0. LiteLLM is not in the M0 data path.
 
 **Tech Stack:** Rust stable; Tokio 1.x; Axum 0.8.x; Reqwest 0.12.x with rustls + stream; SQLx 0.8.x with SQLite + migrations; Clap 4.x; Serde/serde_json; tracing/tracing-subscriber; uuid; sha2; tempfile for integration tests; purpose-built benchmark binary for local proxy overhead.
 
@@ -21,22 +21,26 @@
 - Streaming MUST be forwarded incrementally; the proxy MUST NOT buffer the complete upstream response before returning it to Codex.
 - One upstream provider invocation equals one immutable attempt record.
 - Raw prompts, source code, model output, Authorization headers, cookies, API keys, and environment secrets MUST NOT be persisted by default.
+- M0 MUST NOT create, request, read, refresh, or persist an API key or Codex credential. It MUST NOT read `~/.codex/auth.json` or the operating-system credential store.
+- Incoming authorization may be held in memory only for the active request and forwarded only to the pinned, contract-verified HTTPS Codex upstream. Redirects are disabled so credentials cannot cross origins.
 - `SECRET` data is never exportable.
 - SQLite is sufficient for M0 core operation; no Supabase dependency is permitted.
-- OpenAI upstream retry is owned by Arbiter. Reqwest performs no automatic semantic retry; Codex custom-provider retries MUST be set to zero in the managed profile for M0 contract tests so retry amplification is measurable.
+- Codex upstream retry is owned by Arbiter. Reqwest performs no automatic semantic retry; Codex custom-provider retries MUST be set to zero in the managed profile for M0 contract tests so retry amplification is measurable.
 - Software release and policy state remain separate; M0 ships a fixed local baseline artifact, not an adaptive policy compiler.
-- `OpenAIProvider` is first-class. `LiteLLMProvider` is not required to complete M0.
+- `CodexUpstreamProvider` is first-class. A standalone OpenAI API-key provider and `LiteLLMProvider` are not required to complete M0.
 - M0 acceptance requires direct-vs-proxy benchmark evidence and safe uninstall/restoration of the user's previous Codex configuration.
 - No dashboard, hosted control plane, Supabase sink, evaluation harness, BENCH, shadow execution, policy promotion, ML routing, or multi-harness support in M0.
 
 ## Contract Gate Findings Frozen for M0
 
-1. Codex supports custom providers through `model_providers.<id>.base_url` plus `wire_api = "responses"`. The OpenAI Codex repository contains a strict Responses API proxy that forwards `POST /v1/responses`, providing an authoritative behavioral reference for M0.
+1. Codex supports custom providers through `model_providers.<id>.base_url` plus `wire_api = "responses"`. Official Codex documentation states that `requires_openai_auth = true` reuses the active Codex OpenAI authentication, including ChatGPT login, for an LLM proxy and ignores `env_key`.
 2. Current contract verification identified `gpt-5.6-luna`, `gpt-5.6-terra`, and `gpt-5.6-sol`; the M0 baseline is `gpt-5.6-terra` + `medium`. Live contract probes remain authoritative at implementation time.
 3. M0 must preserve the incoming Codex request body except for the fixed baseline model/effort normalization explicitly tested below.
 4. Responses streaming exposes terminal completion information and usage. M0 may tee/parse SSE events for metadata, but bytes returned to Codex remain the upstream stream.
-5. LiteLLM remains optional because the direct OpenAI path is the authoritative compatibility baseline.
+5. LiteLLM remains optional because direct Codex behavior with the same Codex-managed login is the authoritative compatibility baseline.
 6. SQLx supports SQLite pools, migrations, and explicit transactions. M0 uses it for durable append-only events and remains ready for M1 budget reservations without replacing persistence.
+7. Codex owns credential acquisition and refresh. Arbiter receives authorization on the localhost provider request, never reads Codex credential storage, and forwards secrets only to the pinned Codex upstream with redirects disabled.
+8. Contract evidence on 2026-08-20: the official [Codex authentication documentation](https://learn.chatgpt.com/docs/auth) defines `requires_openai_auth = true` specifically for LLM proxies and permits ChatGPT login; the official [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference) defines the custom-provider fields; local `codex login status` reports ChatGPT authentication on Codex CLI `0.148.0-alpha.21`.
 
 ## Planned Repository Structure
 
@@ -64,7 +68,7 @@ crates/
       lib.rs
       store.rs
 
-  arbiter-provider-openai/
+  arbiter-provider-codex/
     Cargo.toml
     src/
       lib.rs
@@ -112,7 +116,7 @@ tests/
     codex_config_roundtrip.rs
     daemon_health.rs
   contract/
-    openai_live.rs
+    codex_direct_live.rs
     codex_cli_live.rs
   security/
     secret_redaction.rs
@@ -170,20 +174,22 @@ docs/
 - [ ] Test duplicate IDs and database reopen/persistence.
 - [ ] Commit: `feat: add durable sqlite event store`.
 
-### Task 4: Implement the direct OpenAI Responses streaming provider
+### Task 4: Implement the Codex-authenticated Responses streaming provider
 
-**Files:** `crates/arbiter-provider-openai/src/{provider,sse,lib}.rs`, `tests/fixtures/response_completed.sse`.
+**Files:** rename the scaffold crate to `crates/arbiter-provider-codex`, then implement `src/{provider,sse,lib}.rs` and `tests/fixtures/response_completed.sse`.
 
-**Produces:** `OpenAIProvider::new`, one-call Responses forwarding, streamed upstream response, and parsed terminal usage metadata. Provider performs no semantic retries internally.
+**Produces:** `CodexUpstreamProvider::new`, one-call Responses forwarding with Codex-managed authentication, streamed upstream response, and parsed terminal usage metadata. Provider performs no semantic retries internally.
 
 - [ ] Create a terminal Responses SSE fixture and a failing parser test for response ID, input/cached/output/reasoning token fields.
 - [ ] Implement an incremental SSE metadata parser tolerant of arbitrary byte chunk boundaries; test every split point of the fixture.
 - [ ] Build Reqwest client with redirects disabled and no application retry loop.
-- [ ] Override `Host`/`Authorization`; never forward incoming Authorization, Cookie, or Proxy-Authorization; preserve safe non-hop-by-hop Codex headers.
+- [ ] Accept incoming `Authorization` only from the localhost Codex request and forward it unchanged only to the pinned, contract-verified HTTPS Codex upstream. Override `Host`; never forward `Cookie`, `Proxy-Authorization`, hop-by-hop headers, or authorization to redirects/caller-selected origins.
+- [ ] Prove with a fake upstream that authorization is forwarded for the active request but its value never appears in errors, debug output, persisted metadata, or provider structs after request construction.
+- [ ] Forward required non-secret Codex headers and any contract-required account/workspace headers without logging or persistence; document each allowlisted header.
 - [ ] Normalize only `model = gpt-5.6-terra` and `reasoning.effort = medium`; preserve all other request fields semantically, including unknown fields.
 - [ ] Expose upstream `bytes_stream()` without whole-response buffering. Metadata extraction must be tee-like and must not delay downstream chunks for database writes.
 - [ ] Run provider tests.
-- [ ] Commit: `feat: add streaming openai responses provider`.
+- [ ] Commit: `feat: add codex-authenticated responses provider`.
 
 ### Task 5: Implement the localhost daemon and strict Responses proxy
 
@@ -221,7 +227,7 @@ docs/
 **Managed names:** provider `arbiter`, profile `arbiter`.
 
 - [ ] Test config containing unrelated providers/comments/settings: install Arbiter, preserve unrelated TOML, uninstall, restore from verified backup.
-- [ ] Use `toml_edit` to add a Responses provider pointing to `http://127.0.0.1:PORT/v1` with `request_max_retries = 0` and `stream_max_retries = 0` plus an Arbiter profile with Terra/Medium.
+- [ ] Use `toml_edit` to add a Responses provider pointing to `http://127.0.0.1:PORT/v1` with `requires_openai_auth = true`, `request_max_retries = 0`, and `stream_max_retries = 0` plus an Arbiter profile with Terra/Medium. Do not add `env_key` or an embedded bearer token.
 - [ ] Do not change the user's default Codex profile automatically.
 - [ ] Write backup to `~/.arbiter/backups/codex-config-<timestamp>.toml`, close/fsync it, then update config through temp file + same-filesystem atomic rename.
 - [ ] Store/verify backup hash. If config changed after Arbiter install, report conflict rather than silently overwriting newer user changes.
@@ -235,27 +241,28 @@ docs/
 - [ ] Define Clap commands. `InitTarget` contains only Codex in M0.
 - [ ] Implement `arbiter init codex` as plan-then-apply; noninteractive mutation requires `--yes`.
 - [ ] Initialize Arbiter home, DB/migrations, local config, Codex backup, managed provider/profile. Remain PASSTHROUGH.
-- [ ] Implement `start`, resolving API credential without persistence, starting local daemon, and writing server metadata containing PID/port/version only.
+- [ ] Implement `start` without resolving or reading credentials; start the local daemon and write server metadata containing PID/port/version only.
 - [ ] Implement `status`: daemon health, PASSTHROUGH mode, baseline, provider reachability, storage integrity, Codex profile state, recent attempt counts.
-- [ ] Implement `doctor`: config parse, DB integrity, port, API credential presence without printing it, Terra/Medium contract config, Codex binary, managed profile/provider, no remote export, local binding only. Required failures return nonzero.
+- [ ] Implement `doctor`: config parse, DB integrity, port, `codex login status` success without reading credential storage, Terra/Medium contract config, Codex binary, `requires_openai_auth = true`, managed profile/provider, no remote export, local binding only. Required failures return nonzero.
 - [ ] Implement `uninstall`: stop daemon, safely restore Codex config, preserve Arbiter DB by default and print its path for manual deletion.
 - [ ] Test full `init -> status -> uninstall` with temporary HOME.
 - [ ] Commit: `feat: add m0 arbiter cli lifecycle`.
 
-### Task 9: Run live OpenAI and Codex contract probes
+### Task 9: Run live direct-Codex and Codex-through-Arbiter contract probes
 
-**Files:** `tests/contract/{openai_live,codex_cli_live}.rs`, `docs/m0/contract-gates.md`.
+**Files:** `tests/contract/{codex_direct_live,codex_cli_live}.rs`, `docs/m0/contract-gates.md`.
 
-Contract tests are ignored by default and require explicit environment configuration.
+Contract tests are ignored by default and require an authenticated local Codex session. They MUST NOT require `OPENAI_API_KEY`.
 
-- [ ] Direct OpenAI live test: Terra/Medium, streaming enabled; assert HTTP success, streamed event(s), terminal completion, parseable model/usage.
-- [ ] Governor/Arbiter passthrough live test: same semantic request through `/v1/responses`; assert equivalent terminal shape and usage extraction.
+- [ ] Direct Codex live test using the existing Codex-managed login: Terra/Medium, streaming enabled; assert success and capture only privacy-safe behavioral evidence.
+- [ ] Codex-through-Arbiter live test: same semantic command and login through the managed provider; assert equivalent terminal behavior, streamed events, and usage extraction.
 - [ ] Live Codex probe using temporary profile: `codex exec -p arbiter "Reply with exactly: arbiter-ok"`; assert exit 0, expected terminal user output, valid attempt records, and no content persisted.
 - [ ] Do not assert one Codex command equals one model call; Codex is agentic.
 - [ ] Probe cancellation by terminating a streaming Codex request and prove no false AttemptCompleted is recorded.
 - [ ] Record tested Codex/Arbiter versions, target/effort, Responses behavior, cancellation, paths/headers, retry settings, date and PASS/FAIL without secrets/prompts/source.
-- [ ] M0 is not contract-complete until direct OpenAI and Codex-through-Arbiter probes pass. Material mismatch requires plan/spec amendment, not compatibility hacks.
-- [ ] Commit: `test: verify codex and openai m0 contracts`.
+- [ ] Prove the proxy works with ChatGPT login and requires no Arbiter-owned API key. If the active Codex login uses an API key, treat it as Codex-owned and do not read or copy it.
+- [ ] M0 is not contract-complete until direct Codex and Codex-through-Arbiter probes pass. Material mismatch requires plan/spec amendment, not compatibility hacks.
+- [ ] Commit: `test: verify codex-authenticated m0 contracts`.
 
 ### Task 10: Benchmark proxy overhead and enforce M0 performance evidence
 
@@ -288,7 +295,7 @@ Contract tests are ignored by default and require explicit environment configura
 - [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
 - [ ] Run `cargo test --workspace` and `cargo test --workspace --release`.
 - [ ] Run `cargo deny check`.
-- [ ] Run ignored live OpenAI and Codex contract suites explicitly and record evidence.
+- [ ] Run ignored direct-Codex and Codex-through-Arbiter contract suites explicitly and record evidence.
 - [ ] Run the proxy benchmark and require M0 SLO evidence or open a blocking performance finding.
 - [ ] Manual smoke: `arbiter init codex`, `arbiter doctor`, `arbiter start`, `codex exec -p arbiter "Reply with exactly: m0-ok"`, `arbiter status`, `arbiter uninstall`; verify direct Codex config restoration.
 - [ ] Complete release checklist for Responses compatibility, streaming, cancellation, one invocation/one attempt, SQLite durability, content/secret privacy, localhost binding, safe install/uninstall, provider failures, performance evidence, and tested versions.
@@ -299,7 +306,7 @@ Contract tests are ignored by default and require explicit environment configura
 
 ### Spec coverage
 
-M0 requirements are covered by Tasks 1–12: daemon/Responses proxy, OpenAIProvider, streaming/cancellation, local durable events, status/doctor, fixed baseline, privacy, safe Codex config restoration, contract probes, performance benchmark, failure injection/shutdown, and release evidence.
+M0 requirements are covered by Tasks 1–12: daemon/Responses proxy, CodexUpstreamProvider, Codex-managed authentication, streaming/cancellation, local durable events, status/doctor, fixed baseline, privacy, safe Codex config restoration, contract probes, performance benchmark, failure injection/shutdown, and release evidence.
 
 Explicitly deferred:
 
@@ -316,7 +323,7 @@ The plan contains no unresolved placeholders or generic implementation instructi
 
 - Core defines IDs, baseline, effort, and event payloads.
 - SQLite consumes core events only.
-- OpenAI provider consumes baseline and emits streamed response/usage metadata.
+- Codex upstream provider consumes baseline and emits streamed response/usage metadata without owning credentials.
 - Daemon composes provider + store.
 - Codex adapter edits Codex configuration only; it does not proxy traffic.
 - CLI orchestrates daemon/config lifecycle; it does not implement provider logic.
