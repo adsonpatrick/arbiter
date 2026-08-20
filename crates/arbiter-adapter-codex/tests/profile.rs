@@ -1,4 +1,6 @@
-use arbiter_adapter_codex::{CodexProfileError, install_profile, uninstall_profile};
+use arbiter_adapter_codex::{
+    CodexProfileError, install_profile, uninstall_profile, validate_managed_profile,
+};
 use tempfile::tempdir;
 
 const ORIGINAL: &str = include_str!("../../../tests/fixtures/codex_config_existing_provider.toml");
@@ -33,10 +35,30 @@ fn install_preserves_unrelated_toml_and_uninstall_restores_exact_backup() {
     assert!(!installed.contains("experimental_bearer_token"));
     assert!(receipt.backup_path.exists());
     assert!(receipt.backup_hash_path.exists());
+    validate_managed_profile(&config_path, 43_123).expect("valid managed profile");
 
     uninstall_profile(&config_path, &receipt).expect("uninstall profile");
 
     assert_eq!(std::fs::read_to_string(&config_path).unwrap(), ORIGINAL);
+}
+
+#[test]
+fn validation_rejects_credentials_or_contract_changes_in_managed_entries() {
+    let temporary = tempdir().unwrap();
+    let config_path = temporary.path().join("codex/config.toml");
+    let arbiter_home = temporary.path().join("arbiter");
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::fs::write(&config_path, ORIGINAL).unwrap();
+    install_profile(&config_path, &arbiter_home, 43_123, 6).unwrap();
+    let changed = std::fs::read_to_string(&config_path).unwrap().replace(
+        "stream_max_retries = 0",
+        "stream_max_retries = 0\nenv_key = \"FORBIDDEN\"",
+    );
+    std::fs::write(&config_path, changed).unwrap();
+
+    let error = validate_managed_profile(&config_path, 43_123).unwrap_err();
+
+    assert!(matches!(error, CodexProfileError::ManagedEntryInvalid));
 }
 
 #[test]
@@ -112,4 +134,18 @@ fn uninstall_refuses_a_tampered_backup_without_touching_the_config() {
 
     assert!(matches!(error, CodexProfileError::BackupHashMismatch));
     assert_eq!(std::fs::read(config_path).unwrap(), installed);
+}
+
+#[test]
+fn uninstall_removes_a_config_that_did_not_exist_before_install() {
+    let temporary = tempdir().unwrap();
+    let config_path = temporary.path().join("codex/config.toml");
+    let arbiter_home = temporary.path().join("arbiter");
+
+    let receipt = install_profile(&config_path, &arbiter_home, 43_123, 5).unwrap();
+    assert!(config_path.exists());
+
+    uninstall_profile(&config_path, &receipt).unwrap();
+
+    assert!(!config_path.exists());
 }

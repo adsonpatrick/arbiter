@@ -2,4 +2,4 @@
 
 mod store;
 
-pub use store::{SqliteEventStore, StoreError};
+pub use store::{RecentAttemptCounts, SqliteEventStore, StoreError};

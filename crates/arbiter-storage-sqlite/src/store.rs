@@ -34,6 +34,13 @@ pub struct SqliteEventStore {
     pool: SqlitePool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecentAttemptCounts {
+    pub started: u64,
+    pub completed: u64,
+    pub failed: u64,
+}
+
 impl SqliteEventStore {
     /// Opens or creates an event database, runs migrations, and verifies integrity.
     ///
@@ -126,6 +133,33 @@ impl SqliteEventStore {
             .map_err(StoreError::from)
     }
 
+    /// Counts attempt lifecycle events at or after a Unix millisecond timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the count query cannot be executed or represented.
+    pub async fn recent_attempt_counts(
+        &self,
+        since_unix_ms: u64,
+    ) -> Result<RecentAttemptCounts, StoreError> {
+        let since = i64::try_from(since_unix_ms).map_err(|_| StoreError::IntegerOutOfRange)?;
+        let (started, completed, failed): (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+                COALESCE(SUM(CASE WHEN event_type = 'attempt_started' THEN 1 ELSE 0 END), 0), \
+                COALESCE(SUM(CASE WHEN event_type = 'attempt_completed' THEN 1 ELSE 0 END), 0), \
+                COALESCE(SUM(CASE WHEN event_type = 'attempt_failed' THEN 1 ELSE 0 END), 0) \
+             FROM governor_events WHERE occurred_at_unix_ms >= ?",
+        )
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(RecentAttemptCounts {
+            started: u64::try_from(started).map_err(|_| StoreError::IntegerOutOfRange)?,
+            completed: u64::try_from(completed).map_err(|_| StoreError::IntegerOutOfRange)?,
+            failed: u64::try_from(failed).map_err(|_| StoreError::IntegerOutOfRange)?,
+        })
+    }
+
     pub async fn close(&self) {
         self.pool.close().await;
     }
@@ -204,6 +238,17 @@ mod tests {
                 .await
                 .expect("read events"),
             vec![started, completed]
+        );
+        assert_eq!(
+            reopened
+                .recent_attempt_counts(0)
+                .await
+                .expect("attempt counts"),
+            super::RecentAttemptCounts {
+                started: 1,
+                completed: 1,
+                failed: 0,
+            }
         );
     }
 

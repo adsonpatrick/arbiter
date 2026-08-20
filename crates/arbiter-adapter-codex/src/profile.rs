@@ -1,19 +1,22 @@
 use std::{
     fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
 };
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::config_file::{atomic_replace, sha256, write_new_synced};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstallReceipt {
     pub backup_path: PathBuf,
     pub backup_hash_path: PathBuf,
     pub original_sha256: String,
     pub installed_sha256: String,
+    pub original_existed: bool,
 }
 
 #[derive(Debug, Error)]
@@ -32,6 +35,8 @@ pub enum CodexProfileError {
     ConfigurationConflict,
     #[error("Codex configuration backup failed hash verification")]
     BackupHashMismatch,
+    #[error("Codex Arbiter provider or profile is missing or does not match M0")]
+    ManagedEntryInvalid,
 }
 
 /// Installs the managed Arbiter provider and profile without changing the default profile.
@@ -45,7 +50,11 @@ pub fn install_profile(
     port: u16,
     timestamp_unix_ms: u64,
 ) -> Result<InstallReceipt, CodexProfileError> {
-    let original = fs::read(config_path)?;
+    let (original, original_existed) = match fs::read(config_path) {
+        Ok(bytes) => (bytes, true),
+        Err(error) if error.kind() == ErrorKind::NotFound => (Vec::new(), false),
+        Err(error) => return Err(error.into()),
+    };
     let original_text = std::str::from_utf8(&original)?;
     let mut document = original_text.parse::<DocumentMut>()?;
     if managed_entry_exists(&document, "model_providers")
@@ -72,6 +81,7 @@ pub fn install_profile(
         backup_hash_path,
         original_sha256,
         installed_sha256,
+        original_existed,
     })
 }
 
@@ -96,7 +106,35 @@ pub fn uninstall_profile(
         return Err(CodexProfileError::BackupHashMismatch);
     }
 
-    atomic_replace(config_path, &backup)
+    if receipt.original_existed {
+        atomic_replace(config_path, &backup)
+    } else {
+        fs::remove_file(config_path).map_err(CodexProfileError::from)
+    }
+}
+
+/// Verifies that the managed provider and profile exactly match the M0 contract.
+///
+/// # Errors
+///
+/// Returns an error when the configuration cannot be read or parsed, or when a
+/// managed field is absent or has changed.
+pub fn validate_managed_profile(config_path: &Path, port: u16) -> Result<(), CodexProfileError> {
+    let source = fs::read(config_path)?;
+    let document = std::str::from_utf8(&source)?.parse::<DocumentMut>()?;
+    let provider = document["model_providers"]["arbiter"]
+        .as_table()
+        .ok_or(CodexProfileError::ManagedEntryInvalid)?;
+    let profile = document["profiles"]["arbiter"]
+        .as_table()
+        .ok_or(CodexProfileError::ManagedEntryInvalid)?;
+    let expected_provider = provider_table(port);
+    let expected_profile = profile_table();
+    if table_matches(provider, &expected_provider) && table_matches(profile, &expected_profile) {
+        Ok(())
+    } else {
+        Err(CodexProfileError::ManagedEntryInvalid)
+    }
 }
 
 fn managed_entry_exists(document: &DocumentMut, section: &str) -> bool {
@@ -111,6 +149,22 @@ fn insert_managed_table(document: &mut DocumentMut, section: &str, managed: Tabl
         document[section] = Item::Table(Table::new());
     }
     document[section]["arbiter"] = Item::Table(managed);
+}
+
+fn table_matches(actual: &Table, expected: &Table) -> bool {
+    expected.iter().all(|(key, expected_value)| {
+        let actual_value = actual.get(key);
+        if let Some(expected_string) = expected_value.as_str() {
+            actual_value.and_then(Item::as_str) == Some(expected_string)
+        } else if let Some(expected_bool) = expected_value.as_bool() {
+            actual_value.and_then(Item::as_bool) == Some(expected_bool)
+        } else if let Some(expected_integer) = expected_value.as_integer() {
+            actual_value.and_then(Item::as_integer) == Some(expected_integer)
+        } else {
+            false
+        }
+    }) && !actual.contains_key("env_key")
+        && !actual.contains_key("experimental_bearer_token")
 }
 
 fn provider_table(port: u16) -> Table {

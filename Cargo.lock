@@ -78,6 +78,7 @@ name = "arbiter-adapter-codex"
 version = "0.1.0"
 dependencies = [
  "arbiter-core",
+ "serde",
  "sha2",
  "tempfile",
  "thiserror",
@@ -92,8 +93,13 @@ dependencies = [
  "arbiter-adapter-codex",
  "arbiter-core",
  "arbiter-daemon",
+ "arbiter-provider-codex",
  "arbiter-storage-sqlite",
  "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
