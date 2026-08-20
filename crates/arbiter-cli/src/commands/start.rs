@@ -1,4 +1,7 @@
-use std::{process::Stdio, time::Duration};
+use std::{
+    process::Stdio,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, bail};
 use arbiter_adapter_codex::{
@@ -65,6 +68,16 @@ async fn run_foreground(paths: &Paths, config: &super::LocalConfig) -> anyhow::R
     let store = SqliteEventStore::open(&paths.database)
         .await
         .context("open Arbiter event database")?;
+    let recovered_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_millis()
+        .try_into()
+        .context("timestamp exceeds supported range")?;
+    store
+        .reconcile_incomplete_attempts(recovered_at_unix_ms)
+        .await
+        .context("reconcile interrupted Arbiter attempts")?;
     let metadata = ServerMetadata {
         pid: std::process::id(),
         port: config.port,

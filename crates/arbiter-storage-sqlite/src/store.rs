@@ -1,6 +1,9 @@
 use std::{path::Path, time::Duration};
 
-use arbiter_core::{events::GovernorEvent, ids::AttemptId};
+use arbiter_core::{
+    events::{AttemptFailed, ErrorClass, GovernorEvent, GovernorEventKind},
+    ids::AttemptId,
+};
 use sqlx::{
     SqlitePool,
     migrate::MigrateError,
@@ -23,12 +26,19 @@ pub enum StoreError {
     Integrity(String),
     #[error("event numeric field is outside SQLite's signed integer range")]
     IntegerOutOfRange,
+    #[error("attempt {attempt_id} already has a terminal event")]
+    DuplicateTerminal { attempt_id: String },
 }
 
 impl StoreError {
     #[must_use]
     pub fn is_duplicate_event(&self) -> bool {
         matches!(self, Self::Sqlx(sqlx::Error::Database(error)) if error.is_unique_violation())
+    }
+
+    #[must_use]
+    pub const fn is_duplicate_terminal(&self) -> bool {
+        matches!(self, Self::DuplicateTerminal { .. })
     }
 }
 
@@ -88,7 +98,7 @@ impl SqliteEventStore {
         let attempt_index = i64::from(event.attempt_index());
         let payload = serde_json::to_string(event)?;
 
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO governor_events (\
                 event_id, occurred_at_unix_ms, event_type, request_id, attempt_id, \
                 schema_version, payload_json, attempt_index\
@@ -103,7 +113,15 @@ impl SqliteEventStore {
         .bind(payload)
         .bind(attempt_index)
         .execute(&self.pool)
-        .await?;
+        .await;
+        if let Err(error) = result {
+            if is_duplicate_terminal_error(&error) {
+                return Err(StoreError::DuplicateTerminal {
+                    attempt_id: event.attempt_id().to_string(),
+                });
+            }
+            return Err(error.into());
+        }
         self.checkpoint_tx.send_replace(());
 
         Ok(())
@@ -191,6 +209,80 @@ impl SqliteEventStore {
         })
     }
 
+    /// Marks every started attempt without a terminal as interrupted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when recovery time is out of range, stored events are
+    /// invalid, or the reconciliation transaction cannot commit.
+    pub async fn reconcile_incomplete_attempts(
+        &self,
+        recovered_at_unix_ms: u64,
+    ) -> Result<u64, StoreError> {
+        let recovered_at =
+            i64::try_from(recovered_at_unix_ms).map_err(|_| StoreError::IntegerOutOfRange)?;
+        let mut transaction = self.pool.begin().await?;
+        let payloads = sqlx::query_scalar::<_, String>(
+            "SELECT started.payload_json
+             FROM governor_events AS started
+             WHERE started.event_type = 'attempt_started'
+               AND started.rowid = (
+                   SELECT MIN(first_start.rowid)
+                   FROM governor_events AS first_start
+                   WHERE first_start.attempt_id = started.attempt_id
+                     AND first_start.event_type = 'attempt_started'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM governor_events AS terminal
+                   WHERE terminal.attempt_id = started.attempt_id
+                     AND terminal.event_type IN ('attempt_completed', 'attempt_failed')
+               )
+             ORDER BY started.rowid",
+        )
+        .fetch_all(&mut *transaction)
+        .await?;
+
+        for payload in &payloads {
+            let started: GovernorEvent = serde_json::from_str(payload)?;
+            let GovernorEventKind::AttemptStarted(started) = started.kind else {
+                continue;
+            };
+            let failed = GovernorEvent::attempt_failed(AttemptFailed {
+                request_id: started.request_id,
+                attempt_id: started.attempt_id,
+                attempt_index: started.attempt_index,
+                target: started.target,
+                started_at_unix_ms: started.started_at_unix_ms,
+                failed_at_unix_ms: recovered_at_unix_ms,
+                duration_ms: recovered_at_unix_ms.saturating_sub(started.started_at_unix_ms),
+                error_class: ErrorClass::StreamInterrupted,
+            });
+            let payload = serde_json::to_string(&failed)?;
+            sqlx::query(
+                "INSERT INTO governor_events (
+                    event_id, occurred_at_unix_ms, event_type, request_id, attempt_id,
+                    schema_version, payload_json, attempt_index
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(failed.event_id.to_string())
+            .bind(recovered_at)
+            .bind(failed.event_type())
+            .bind(failed.request_id().to_string())
+            .bind(failed.attempt_id().to_string())
+            .bind(i64::from(failed.schema_version))
+            .bind(payload)
+            .bind(i64::from(failed.attempt_index()))
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        transaction.commit().await?;
+        if !payloads.is_empty() {
+            self.checkpoint_tx.send_replace(());
+        }
+        u64::try_from(payloads.len()).map_err(|_| StoreError::IntegerOutOfRange)
+    }
+
     pub async fn close(&self) {
         self.pool.close().await;
     }
@@ -203,6 +295,10 @@ impl SqliteEventStore {
             Err(StoreError::Integrity(result))
         }
     }
+}
+
+fn is_duplicate_terminal_error(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(database) if database.message().contains("arbiter: duplicate terminal event"))
 }
 
 fn spawn_idle_checkpoints(pool: &SqlitePool) -> watch::Sender<()> {
@@ -243,12 +339,15 @@ fn spawn_idle_checkpoints(pool: &SqlitePool) -> watch::Sender<()> {
 mod tests {
     use arbiter_core::{
         config::BaselineTarget,
-        events::{AttemptCompleted, AttemptStarted, GovernorEvent, TokenUsage},
+        events::{
+            AttemptCompleted, AttemptFailed, AttemptStarted, ErrorClass, GovernorEvent,
+            GovernorEventKind, TokenUsage,
+        },
         ids::{AttemptId, RequestId},
     };
     use tempfile::tempdir;
 
-    use super::SqliteEventStore;
+    use super::{SqliteEventStore, StoreError};
 
     fn attempt_events() -> (AttemptId, GovernorEvent, GovernorEvent) {
         let request_id = RequestId::new();
@@ -360,5 +459,106 @@ mod tests {
             .expect("read WAL checkpoint policy");
 
         assert_eq!(auto_checkpoint, 0);
+    }
+
+    #[tokio::test]
+    async fn a_second_terminal_for_an_attempt_is_rejected() {
+        let temporary = tempdir().expect("temporary directory");
+        let store = SqliteEventStore::open(temporary.path().join("arbiter.db"))
+            .await
+            .expect("open store");
+        let (attempt_id, started, completed) = attempt_events();
+        let failed = GovernorEvent::attempt_failed(AttemptFailed {
+            request_id: started.request_id(),
+            attempt_id,
+            attempt_index: 0,
+            target: BaselineTarget::m0(),
+            started_at_unix_ms: 1_000,
+            failed_at_unix_ms: 1_030,
+            duration_ms: 30,
+            error_class: ErrorClass::StreamInterrupted,
+        });
+        store.append(&started).await.expect("append start");
+        store.append(&completed).await.expect("append completion");
+
+        let error = store
+            .append(&failed)
+            .await
+            .expect_err("second terminal must fail");
+
+        assert!(
+            matches!(error, StoreError::DuplicateTerminal { attempt_id: id } if id == attempt_id.to_string())
+        );
+        assert_eq!(
+            store.events_for_attempt(attempt_id).await.unwrap(),
+            vec![started, completed]
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_attempt_recovery_is_transactional_and_idempotent() {
+        let temporary = tempdir().expect("temporary directory");
+        let store = SqliteEventStore::open(temporary.path().join("arbiter.db"))
+            .await
+            .expect("open store");
+        let (attempt_id, started, _) = attempt_events();
+        store.append(&started).await.expect("append start");
+
+        assert_eq!(store.reconcile_incomplete_attempts(2_000).await.unwrap(), 1);
+        assert_eq!(store.reconcile_incomplete_attempts(2_001).await.unwrap(), 0);
+        let events = store.events_for_attempt(attempt_id).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[1].kind,
+            GovernorEventKind::AttemptFailed(failed)
+                if failed.error_class == ErrorClass::StreamInterrupted
+                    && failed.failed_at_unix_ms == 2_000
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_trigger_migrates_legacy_duplicates_without_deleting_them() {
+        let temporary = tempdir().expect("temporary directory");
+        let database = temporary.path().join("legacy.db");
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=rwc", database.display()))
+            .await
+            .expect("open legacy database");
+        sqlx::raw_sql(include_str!("../migrations/0001_m0_events.sql"))
+            .execute(&pool)
+            .await
+            .expect("apply original migration");
+        for event_id in ["legacy-completed", "legacy-failed"] {
+            sqlx::query(
+                "INSERT INTO governor_events (event_id, occurred_at_unix_ms, event_type, request_id, attempt_id, schema_version, payload_json, attempt_index) VALUES (?, 1, ?, 'request', 'attempt', 1, '{}', 0)",
+            )
+            .bind(event_id)
+            .bind(if event_id.ends_with("completed") {
+                "attempt_completed"
+            } else {
+                "attempt_failed"
+            })
+            .execute(&pool)
+            .await
+            .expect("seed legacy terminal");
+        }
+
+        sqlx::raw_sql(include_str!("../migrations/0002_single_terminal.sql"))
+            .execute(&pool)
+            .await
+            .expect("apply terminal trigger migration");
+        let error = sqlx::query(
+            "INSERT INTO governor_events (event_id, occurred_at_unix_ms, event_type, request_id, attempt_id, schema_version, payload_json, attempt_index) VALUES ('new-failed', 2, 'attempt_failed', 'request', 'attempt', 1, '{}', 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("new duplicate terminal must fail");
+
+        assert!(error.to_string().contains("duplicate terminal event"));
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM governor_events WHERE attempt_id = 'attempt'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 2);
     }
 }

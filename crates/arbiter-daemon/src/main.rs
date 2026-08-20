@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Context;
 use arbiter_core::health::DaemonIdentity;
@@ -25,6 +28,22 @@ async fn main() -> anyhow::Result<()> {
     let store = SqliteEventStore::open(&args.database)
         .await
         .context("open Arbiter event database")?;
+    let recovered_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_millis()
+        .try_into()
+        .context("timestamp exceeds supported range")?;
+    let recovered = store
+        .reconcile_incomplete_attempts(recovered_at_unix_ms)
+        .await
+        .context("reconcile interrupted Arbiter attempts")?;
+    if recovered > 0 {
+        tracing::warn!(
+            recovered_attempts = recovered,
+            "reconciled interrupted attempts"
+        );
+    }
 
     serve_local_with_shutdown(
         AppState::new_with_identity(
