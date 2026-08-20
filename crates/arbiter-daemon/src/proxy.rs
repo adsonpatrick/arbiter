@@ -75,8 +75,7 @@ pub(crate) async fn responses(
                 _ => ErrorClass::ProviderSetup,
             };
             let failed = context.failed(error_class);
-            let _ = state.store.append(&failed).await;
-            log_terminal_event(&failed, Some(StatusCode::BAD_GATEWAY));
+            persist_terminal_with_retry(&state.store, &failed, Some(StatusCode::BAD_GATEWAY)).await;
             return response_with_attempt(StatusCode::BAD_GATEWAY, context.attempt_id);
         }
     };
@@ -109,7 +108,7 @@ fn proxy_response(
             .expect("UUID is always a valid header value"),
     );
     let force_cancelled = Box::pin(runtime.cancellation_token().cancelled_owned());
-    let stream = GovernedStream {
+    let mut stream = GovernedStream {
         upstream: upstream.bytes_stream(),
         store,
         runtime,
@@ -118,6 +117,10 @@ fn proxy_response(
         _activity: activity,
         force_cancelled,
     };
+    if !status.is_success() {
+        let event = stream.context.failed(ErrorClass::ProviderHttp);
+        stream.record_terminal(event, Some(status));
+    }
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     *response.headers_mut() = response_headers;
@@ -186,14 +189,46 @@ struct GovernedStream {
 }
 
 impl GovernedStream {
-    fn record(&mut self, event: GovernorEvent) {
+    fn record_terminal(&mut self, event: GovernorEvent, http_status: Option<StatusCode>) {
+        if self.terminal_recorded {
+            return;
+        }
         self.terminal_recorded = true;
         let store = self.store.clone();
         self.runtime.spawn_persistence(async move {
-            if store.append(&event).await.is_ok() {
-                log_terminal_event(&event, None);
-            }
+            persist_terminal_with_retry(&store, &event, http_status).await;
         });
+    }
+}
+
+async fn persist_terminal_with_retry(
+    store: &SqliteEventStore,
+    event: &GovernorEvent,
+    http_status: Option<StatusCode>,
+) {
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        match store.append(event).await {
+            Ok(()) => {
+                log_terminal_event(event, http_status);
+                return;
+            }
+            Err(error) if error.is_duplicate_event() || error.is_duplicate_terminal() => return,
+            Err(_) if attempt < ATTEMPTS => {
+                let delay = std::time::Duration::from_millis(25 * attempt as u64);
+                tokio::time::sleep(delay).await;
+            }
+            Err(_) => {
+                tracing::error!(
+                    event_type = "terminal_persistence_failed",
+                    request_id = %event.request_id(),
+                    attempt_id = %event.attempt_id(),
+                    persistence_attempts = ATTEMPTS,
+                    "Arbiter terminal event was not persisted"
+                );
+                return;
+            }
+        }
     }
 }
 
@@ -238,7 +273,7 @@ impl Stream for GovernedStream {
         if self.force_cancelled.as_mut().poll(context).is_ready() {
             if !self.terminal_recorded {
                 let event = self.context.failed(ErrorClass::Cancelled);
-                self.record(event);
+                self.record_terminal(event, None);
             }
             return Poll::Ready(None);
         }
@@ -251,19 +286,21 @@ impl Stream for GovernedStream {
                     && !self.terminal_recorded
                 {
                     let event = self.context.completed(metadata);
-                    self.record(event);
+                    self.record_terminal(event, None);
                 }
                 Poll::Ready(Some(Ok(bytes)))
             }
             Poll::Ready(Some(Err(error))) => {
-                let event = self.context.failed(ErrorClass::StreamInterrupted);
-                self.record(event);
+                if !self.terminal_recorded {
+                    let event = self.context.failed(ErrorClass::StreamInterrupted);
+                    self.record_terminal(event, None);
+                }
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(None) => {
                 if !self.terminal_recorded {
                     let event = self.context.failed(ErrorClass::StreamInterrupted);
-                    self.record(event);
+                    self.record_terminal(event, None);
                 }
                 Poll::Ready(None)
             }
@@ -276,7 +313,7 @@ impl Drop for GovernedStream {
     fn drop(&mut self) {
         if !self.terminal_recorded {
             let event = self.context.failed(ErrorClass::Cancelled);
-            self.record(event);
+            self.record_terminal(event, None);
         }
     }
 }

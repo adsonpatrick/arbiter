@@ -7,7 +7,10 @@ use std::{
     task::{Context, Poll},
 };
 
-use arbiter_core::{events::GovernorEventKind, ids::AttemptId};
+use arbiter_core::{
+    events::{ErrorClass, GovernorEventKind},
+    ids::AttemptId,
+};
 use arbiter_daemon::{AppState, build_router, local_bind_address};
 use arbiter_provider_codex::provider::CodexUpstreamProvider;
 use arbiter_storage_sqlite::SqliteEventStore;
@@ -22,6 +25,7 @@ use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use serde_json::json;
 use tempfile::tempdir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
 struct HangingUpstreamStream {
@@ -492,6 +496,198 @@ async fn duplicate_terminal_chunks_create_exactly_one_terminal_event() {
     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
     assert_eq!(store.events_for_attempt(attempt_id).await.unwrap().len(), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn completed_metadata_followed_by_transport_error_keeps_one_completion() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider = CodexUpstreamProvider::new_for_loopback_test(listener.local_addr().unwrap())
+        .expect("test provider");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = vec![0_u8; 4_096];
+        let _ = socket.read(&mut request).await.unwrap();
+        let completed = include_bytes!("../../../tests/fixtures/response_completed.sse");
+        let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+        socket.write_all(headers).await.unwrap();
+        socket
+            .write_all(format!("{:X}\r\n", completed.len()).as_bytes())
+            .await
+            .unwrap();
+        socket.write_all(completed).await.unwrap();
+        socket.write_all(b"\r\nZZ\r\n").await.unwrap();
+        socket.flush().await.unwrap();
+    });
+    let temporary = tempdir().unwrap();
+    let store = SqliteEventStore::open(temporary.path().join("arbiter.db"))
+        .await
+        .unwrap();
+    let app = build_router(AppState::new(provider, store.clone()));
+    let request = Request::post("/v1/responses")
+        .header(header::AUTHORIZATION, "Bearer completed-then-error")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"input": "hello"}).to_string()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    let attempt_id = AttemptId::from(
+        response.headers()["x-arbiter-attempt-id"]
+            .to_str()
+            .unwrap()
+            .parse::<uuid::Uuid>()
+            .unwrap(),
+    );
+    let chunks = response
+        .into_body()
+        .into_data_stream()
+        .collect::<Vec<_>>()
+        .await;
+    assert!(chunks.iter().any(Result::is_ok));
+    assert!(chunks.iter().any(Result::is_err));
+    let events = wait_for_events(&store, attempt_id, 2).await;
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        events[1].kind,
+        GovernorEventKind::AttemptCompleted(_)
+    ));
+    assert_eq!(store.events_for_attempt(attempt_id).await.unwrap().len(), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn provider_http_failures_are_transparent_and_classified() {
+    for status in [
+        StatusCode::UNAUTHORIZED,
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    ] {
+        let expected_body = format!("provider failure {}", status.as_u16());
+        let upstream_body = expected_body.clone();
+        let upstream = Router::new().route(
+            "/responses",
+            post(move || {
+                let body = upstream_body.clone();
+                async move {
+                    Response::builder()
+                        .status(status)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = CodexUpstreamProvider::new_for_loopback_test(listener.local_addr().unwrap())
+            .expect("test provider");
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let temporary = tempdir().unwrap();
+        let store = SqliteEventStore::open(temporary.path().join("arbiter.db"))
+            .await
+            .unwrap();
+        let app = build_router(AppState::new(provider, store.clone()));
+        let request = Request::post("/v1/responses")
+            .header(header::AUTHORIZATION, "Bearer provider-http")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"input": "hello"}).to_string()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), status);
+        let attempt_id = AttemptId::from(
+            response.headers()["x-arbiter-attempt-id"]
+                .to_str()
+                .unwrap()
+                .parse::<uuid::Uuid>()
+                .unwrap(),
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, expected_body);
+        let events = wait_for_events(&store, attempt_id, 2).await;
+        let GovernorEventKind::AttemptFailed(failed) = &events[1].kind else {
+            panic!("provider HTTP response must fail the attempt");
+        };
+        assert_eq!(failed.error_class, ErrorClass::ProviderHttp);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn permanent_terminal_write_failure_is_recovered_on_restart() {
+    let release_terminal = Arc::new(tokio::sync::Notify::new());
+    let upstream_release = Arc::clone(&release_terminal);
+    let upstream = Router::new().route(
+        "/responses",
+        post(move || {
+            let release = Arc::clone(&upstream_release);
+            async move {
+                let first = stream::once(async {
+                    Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                        b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
+                    ))
+                });
+                let terminal = stream::once(async move {
+                    release.notified().await;
+                    Ok::<_, std::convert::Infallible>(Bytes::from_static(include_bytes!(
+                        "../../../tests/fixtures/response_completed.sse"
+                    )))
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(first.chain(terminal)))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider = CodexUpstreamProvider::new_for_loopback_test(listener.local_addr().unwrap())
+        .expect("test provider");
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let temporary = tempdir().unwrap();
+    let database = temporary.path().join("arbiter.db");
+    let store = SqliteEventStore::open(&database).await.unwrap();
+    let app = build_router(AppState::new(provider, store.clone()));
+    let request = Request::post("/v1/responses")
+        .header(header::AUTHORIZATION, "Bearer recovery")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"input": "hello"}).to_string()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    let attempt_id = AttemptId::from(
+        response.headers()["x-arbiter-attempt-id"]
+            .to_str()
+            .unwrap()
+            .parse::<uuid::Uuid>()
+            .unwrap(),
+    );
+    let mut body = response.into_body().into_data_stream();
+    body.next().await.unwrap().unwrap();
+    store.close().await;
+    release_terminal.notify_one();
+    while body.next().await.is_some() {}
+    tokio::time::sleep(std::time::Duration::from_millis(125)).await;
+
+    let recovered = SqliteEventStore::open(&database).await.unwrap();
+    assert_eq!(
+        recovered
+            .reconcile_incomplete_attempts(10_000)
+            .await
+            .unwrap(),
+        1
+    );
+    let events = recovered.events_for_attempt(attempt_id).await.unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        &events[1].kind,
+        GovernorEventKind::AttemptFailed(failed)
+            if failed.error_class == ErrorClass::StreamInterrupted
+    ));
     server.abort();
 }
 
