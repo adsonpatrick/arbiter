@@ -45,14 +45,16 @@ assumed to equal one model call because Codex is agentic.
 | Cancellation | PASS — exactly `AttemptStarted` + `AttemptFailed(Cancelled)` after client termination |
 | Privacy scan | PASS — synthetic marker absent from SQLite, WAL, and SHM |
 | Restoration | PASS — exact pre-run existence and SHA-256 restored for both Codex files; daemon stopped |
-| Final live rerun | PASS — 2 ignored tests explicitly executed on parent `a9b7b3f` |
+| Final live rerun | PASS — 2 ignored tests explicitly executed on parent `331db47` |
 | Manual smoke | PASS — doctor/start/`m0-ok`/status/uninstall, exit 0 |
 
 Final smoke status reported five attempts, four completed, storage integrity
 `ok`, a healthy daemon, an installed profile, and reachable provider TCP. A
 non-fatal `/v1/models` 404 was expected because M0 exposes only the strict
 Responses surface. The evidence database was preserved under a fresh temporary
-`ARBITER_HOME` while both Codex file hashes were restored exactly.
+`ARBITER_HOME` while both Codex file hashes were restored exactly. The final
+evidence database is under
+`%TEMP%\arbiter-final-live-290f647bc9414be1b87738be2b4c176c`.
 
 Do not record authorization values, account headers, prompts, responses, or
 source code in this document.

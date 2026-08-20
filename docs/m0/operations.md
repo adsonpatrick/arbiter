@@ -78,7 +78,18 @@ M0 stores only append-only attempt metadata:
 - upstream response ID when a terminal completion provides one;
 - typed failure class.
 
-M0 does not support persistence of prompts, source code, request bodies, response bodies, tool content, authorization, cookies, environment values, or repository paths. SQLite and its WAL/SHM companions must be treated as operational metadata, but they contain none of those content or secret fields by design. Arbiter-owned directories are private and its backup, receipt, configuration, metadata, and database files are owner-only (Unix `0700`/`0600`; protected current-user DACLs on Windows). Windows DACL work runs in a minimal, allowlisted child environment that does not inherit API keys.
+M0 does not support persistence of prompts, source code, request bodies,
+response bodies, tool content, authorization, cookies, environment values, or
+repository paths. SQLite and its WAL/SHM companions must be treated as
+operational metadata, but they contain none of those content or secret fields
+by design. Arbiter-owned directories are private and its backup, receipt,
+configuration, metadata, and database files are owner-only (Unix
+`0700`/`0600`; protected current-user DACLs on Windows). The database lease
+applies this protection even when `arbiter-daemon` is launched directly.
+Windows DACL work runs in a minimal, allowlisted child environment that does
+not inherit API keys. When a pre-existing Codex file grants the current user
+less than the access needed for an atomic replacement, installation refuses
+safely instead of broadening that ACL.
 
 The database enforces at most one terminal event per attempt. Non-success
 provider responses are recorded as `ProviderHttp` while their status and body

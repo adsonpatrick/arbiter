@@ -2,7 +2,7 @@
 
 Date: 2026-08-20  
 Version: `0.1.0`  
-Final evidence parent: `a9b7b3f`
+Final evidence parent: `331db47`
 
 ## Decision
 
@@ -64,8 +64,11 @@ contract, privacy, restoration, dependency, or performance finding remains.
 - [x] Existing named profile files are privately backed up and replaced;
       Arbiter-owned directories/files are hardened, and two-file mutations
       compensate on partial failure.
-- [x] Windows uses tested protected current-user DACLs and exact original-DACL
-      restoration; Unix creates SQLite at `0600` before SQLx opens it.
+- [x] Windows uses tested protected current-user DACLs, refuses safely rather
+      than broadening an overly restrictive original ACL, and restores the
+      exact original DACL; Unix creates SQLite at `0600` before SQLx opens it.
+- [x] The database lease creates or hardens both SQLite and its lock owner-only,
+      including when the standalone daemon is launched directly.
 - [x] `uninstall` verifies hashes, refuses post-install edits, restores exact
       prior existence/content state, stops the daemon, and preserves history.
 - [x] Final live run reported `CONFIG_RESTORED=True`,
@@ -75,11 +78,13 @@ contract, privacy, restoration, dependency, or performance finding remains.
 
 - [x] Final release benchmark used 50 warmups and 1,000 paired direct/proxy
       samples with first-byte forwarding asserted for every response.
-- [x] Added first-byte latency is p50 0.214 ms / p95 1.468 ms / p99 31.636 ms.
-- [x] Added total latency is p50 0.255 ms / p95 1.930 ms / p99 31.874 ms.
+- [x] Added first-byte latency is p50 0.237 ms / p95 1.222 ms / p99 1.575 ms.
+- [x] Added total latency is p50 0.309 ms / p95 1.721 ms / p99 2.232 ms.
 - [x] Both distributions satisfy the 10 / 25 / 50 ms p50/p95/p99 M0 gate.
 - [x] `cargo fmt`, Clippy with `-D warnings`, debug tests, release tests,
       workspace check, `cargo deny`, and diff validation pass.
+- [x] Debug and release suites each execute 71 passing tests; the 2 live tests
+      also pass when explicitly enabled against the Codex ChatGPT login.
 - [x] Dependency audit reports advisories, bans, licenses, and sources `ok`;
       duplicate-version warnings are transitive and non-blocking.
 
