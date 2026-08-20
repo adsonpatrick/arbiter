@@ -85,11 +85,13 @@ operational metadata, but they contain none of those content or secret fields
 by design. Arbiter-owned directories are private and its backup, receipt,
 configuration, metadata, and database files are owner-only (Unix
 `0700`/`0600`; protected current-user DACLs on Windows). The database lease
-applies this protection even when `arbiter-daemon` is launched directly.
-Windows DACL work runs in a minimal, allowlisted child environment that does
-not inherit API keys. When a pre-existing Codex file grants the current user
-less than the access needed for an atomic replacement, installation refuses
-safely instead of broadening that ACL.
+creates DB and lock with their private Windows DACL atomically and applies the
+same protection when `arbiter-daemon` is launched directly. Windows DACL work
+runs in a minimal, allowlisted child environment that does not inherit API
+keys. When a pre-existing Codex file lacks an explicit current-user grant with
+the access needed for atomic replacement, installation refuses safely instead
+of treating a group grant (including a deny-only group) as permission to
+broaden that ACL.
 
 The database enforces at most one terminal event per attempt. Non-success
 provider responses are recorded as `ProviderHttp` while their status and body

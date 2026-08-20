@@ -2,7 +2,7 @@
 
 Date: 2026-08-20
 Version: `0.1.0`
-Final evidence parent: `331db47`
+Final evidence parent: `900ba6d`
 
 ## Decision
 
@@ -67,8 +67,9 @@ contract, privacy, restoration, dependency, or performance finding remains.
 - [x] Windows uses tested protected current-user DACLs, refuses safely rather
       than broadening an overly restrictive original ACL, and restores the
       exact original DACL; Unix creates SQLite at `0600` before SQLx opens it.
-- [x] The database lease creates or hardens both SQLite and its lock owner-only,
-      including when the standalone daemon is launched directly.
+- [x] The database lease creates both SQLite and its lock atomically owner-only
+      on Windows and hardens them on every acquisition, including when the
+      standalone daemon is launched directly.
 - [x] `uninstall` verifies hashes, refuses post-install edits, restores exact
       prior existence/content state, stops the daemon, and preserves history.
 - [x] Final live run reported `CONFIG_RESTORED=True`,
@@ -78,12 +79,12 @@ contract, privacy, restoration, dependency, or performance finding remains.
 
 - [x] Final release benchmark used 50 warmups and 1,000 paired direct/proxy
       samples with first-byte forwarding asserted for every response.
-- [x] Added first-byte latency is p50 0.237 ms / p95 1.222 ms / p99 1.575 ms.
-- [x] Added total latency is p50 0.309 ms / p95 1.721 ms / p99 2.232 ms.
+- [x] Added first-byte latency is p50 0.192 ms / p95 1.194 ms / p99 7.627 ms.
+- [x] Added total latency is p50 0.254 ms / p95 1.705 ms / p99 15.056 ms.
 - [x] Both distributions satisfy the 10 / 25 / 50 ms p50/p95/p99 M0 gate.
 - [x] `cargo fmt`, Clippy with `-D warnings`, debug tests, release tests,
       workspace check, `cargo deny`, and diff validation pass.
-- [x] Debug and release suites each execute 71 passing tests; the 2 live tests
+- [x] Debug and release suites each execute 73 passing tests; the 2 live tests
       also pass when explicitly enabled against the Codex ChatGPT login.
 - [x] Dependency audit reports advisories, bans, licenses, and sources `ok`;
       duplicate-version warnings are transitive and non-blocking.

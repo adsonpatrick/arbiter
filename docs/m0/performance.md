@@ -10,8 +10,8 @@ proxy overhead gate.
 
 | Local added latency | p50 | p95 | p99 | Limit | Result |
 | --- | ---: | ---: | ---: | ---: | --- |
-| First byte | 0.237 ms | 1.222 ms | 1.575 ms | 10 / 25 / 50 ms | PASS |
-| Complete response | 0.309 ms | 1.721 ms | 2.232 ms | 10 / 25 / 50 ms | PASS |
+| First byte | 0.192 ms | 1.194 ms | 7.627 ms | 10 / 25 / 50 ms | PASS |
+| Complete response | 0.254 ms | 1.705 ms | 15.056 ms | 10 / 25 / 50 ms | PASS |
 
 The benchmark also asserts for every proxied response that its first chunk is
 observed before its terminal chunk. All 1,000 measured requests passed, so
@@ -31,12 +31,12 @@ Added distributions are nearest-rank percentiles of the paired
 
 | Metric | Path | p50 | p95 | p99 |
 | --- | --- | ---: | ---: | ---: |
-| First byte | Direct | 15,426 | 16,063 | 16,250 |
-| First byte | Through Arbiter | 15,652 | 16,279 | 16,524 |
-| First byte | Added | 237 | 1,222 | 1,575 |
-| Complete response | Direct | 31,121 | 32,078 | 32,324 |
-| Complete response | Through Arbiter | 31,442 | 32,392 | 32,671 |
-| Complete response | Added | 309 | 1,721 | 2,232 |
+| First byte | Direct | 15,443 | 16,061 | 16,277 |
+| First byte | Through Arbiter | 15,653 | 16,280 | 16,561 |
+| First byte | Added | 192 | 1,194 | 7,627 |
+| Complete response | Direct | 31,162 | 32,016 | 32,267 |
+| Complete response | Through Arbiter | 31,443 | 32,383 | 32,733 |
+| Complete response | Added | 254 | 1,705 | 15,056 |
 
 Windows timer granularity makes the fake upstream's nominal 2 ms sleeps appear
 near 15 ms. This affects both paths and is why the gate uses the paired added
@@ -85,4 +85,4 @@ response content, credential, or API key was stored.
 - 19,165,339,648 bytes physical memory (about 17.85 GiB)
 - Windows 11 Pro 64-bit, version `10.0.26200`, build `26200`
 - Rust/Cargo `1.97.1`, target `x86_64-pc-windows-msvc`
-- Optimized Cargo `release` build from parent commit `331db47`
+- Optimized Cargo `release` build from parent commit `900ba6d`
