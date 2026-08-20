@@ -53,18 +53,19 @@ fn open_file(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
+#[cfg(unix)]
+fn protect_file(file: &File, _path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(windows)]
 fn protect_file(_file: &File, path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        _file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(windows)]
-    windows_acl::protect(path)?;
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (_file, path);
-    }
+    windows_acl::protect(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn protect_file(_file: &File, _path: &Path) -> io::Result<()> {
     Ok(())
 }
 
