@@ -79,6 +79,7 @@ version = "0.1.0"
 dependencies = [
  "arbiter-core",
  "sha2",
+ "tempfile",
  "thiserror",
  "toml_edit",
 ]
