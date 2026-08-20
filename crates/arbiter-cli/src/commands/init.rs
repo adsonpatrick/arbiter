@@ -10,9 +10,9 @@ pub(crate) async fn run(
     paths: &Paths,
     target: InitTarget,
     yes: bool,
-    port: u16,
+    requested_port: Option<u16>,
 ) -> anyhow::Result<()> {
-    if port == 0 {
+    if requested_port == Some(0) {
         bail!("daemon port must be between 1 and 65535");
     }
     match target {
@@ -39,8 +39,11 @@ pub(crate) async fn run(
         bail!("Arbiter is already initialized; uninstall it before initializing again");
     }
 
+    let port = requested_port.map_or_else(reserve_ephemeral_port, Ok)?;
+    let instance_id = uuid::Uuid::new_v4().to_string();
+
     std::fs::create_dir_all(&paths.arbiter_home).context("create Arbiter home")?;
-    let config = default_config(paths, port);
+    let config = default_config(paths, port, instance_id);
     write_json_atomic(&paths.config, &config).context("write local configuration")?;
     let store = SqliteEventStore::open(&paths.database)
         .await
@@ -69,4 +72,10 @@ pub(crate) async fn run(
     println!("Initialized Arbiter in PASSTHROUGH mode.");
     println!("Use Codex profile 'arbiter' to route through the local daemon.");
     Ok(())
+}
+
+fn reserve_ephemeral_port() -> anyhow::Result<u16> {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").context("reserve an ephemeral daemon port")?;
+    Ok(listener.local_addr()?.port())
 }

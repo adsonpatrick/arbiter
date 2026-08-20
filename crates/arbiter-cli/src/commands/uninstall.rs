@@ -3,7 +3,10 @@ use std::time::Duration;
 use anyhow::Context;
 use arbiter_adapter_codex::uninstall_profile;
 
-use super::{Paths, ServerMetadata, read_json, read_receipt, status::endpoint_healthy};
+use super::{
+    Paths, ServerMetadata, read_config, read_json, read_receipt,
+    status::{daemon_is_current, endpoint_responding},
+};
 
 pub(crate) async fn run(paths: &Paths, yes: bool) -> anyhow::Result<()> {
     println!("Plan:");
@@ -16,8 +19,9 @@ pub(crate) async fn run(paths: &Paths, yes: bool) -> anyhow::Result<()> {
     }
 
     let receipt = read_receipt(paths)?;
+    let config = read_config(paths)?;
     require_safe_backup_paths(paths, &receipt)?;
-    stop_daemon(paths).await?;
+    stop_daemon(paths, &config).await?;
     uninstall_profile(&paths.codex_config, &receipt).context("restore Codex configuration")?;
     std::fs::remove_file(&paths.receipt).context("remove installation receipt")?;
     if paths.config.exists() {
@@ -49,12 +53,15 @@ fn require_safe_backup_paths(
     Ok(())
 }
 
-async fn stop_daemon(paths: &Paths) -> anyhow::Result<()> {
+async fn stop_daemon(paths: &Paths, config: &super::LocalConfig) -> anyhow::Result<()> {
     if !paths.server.exists() {
         return Ok(());
     }
     let metadata: ServerMetadata = read_json(&paths.server)?;
-    if !endpoint_healthy(metadata.port).await {
+    if !daemon_is_current(paths, config).await {
+        if endpoint_responding(metadata.port).await {
+            anyhow::bail!("port {} is serving an unrecognized process", metadata.port);
+        }
         std::fs::remove_file(&paths.server).context("remove stale server metadata")?;
         return Ok(());
     }

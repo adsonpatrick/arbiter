@@ -1,6 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arbiter_adapter_codex::validate_managed_profile;
+use arbiter_core::health::DaemonHealth;
 use arbiter_storage_sqlite::SqliteEventStore;
 
 use super::{Paths, ServerMetadata, VERSION, read_config, read_json};
@@ -19,7 +20,10 @@ pub(crate) async fn run(paths: &Paths) -> anyhow::Result<()> {
     let since_unix_ms = now_unix_ms.saturating_sub(24 * 60 * 60 * 1_000);
     let attempts = store.recent_attempt_counts(since_unix_ms).await?;
     store.close().await;
-    let daemon_running = daemon_is_current(paths, config.port).await;
+    let daemon_running = daemon_is_current(paths, &config).await;
+    if !daemon_running && endpoint_responding(config.port).await {
+        anyhow::bail!("port {} is serving an unrecognized process", config.port);
+    }
     let provider_reachable = provider_reachable().await;
     let profile = if validate_managed_profile(&config.codex_config, config.port).is_ok() {
         "installed"
@@ -59,26 +63,42 @@ async fn provider_reachable() -> bool {
     .is_ok_and(|result| result.is_ok())
 }
 
-pub(crate) async fn daemon_is_current(paths: &Paths, port: u16) -> bool {
+pub(crate) async fn daemon_is_current(paths: &Paths, config: &super::LocalConfig) -> bool {
     let Ok(metadata) = read_json::<ServerMetadata>(&paths.server) else {
         return false;
     };
     metadata.pid > 0
-        && metadata.port == port
+        && metadata.port == config.port
         && metadata.version == VERSION
-        && endpoint_healthy(port).await
+        && metadata.instance_id == config.instance_id
+        && endpoint_health(config.port)
+            .await
+            .is_some_and(|health| health.identity == metadata)
 }
 
-pub(crate) async fn endpoint_healthy(port: u16) -> bool {
+pub(crate) async fn endpoint_health(port: u16) -> Option<DaemonHealth> {
     let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_millis(300))
         .build()
     else {
-        return false;
+        return None;
     };
-    client
+    let response = client
         .get(format!("http://127.0.0.1:{port}/healthz"))
         .send()
         .await
-        .is_ok_and(|response| response.status().is_success())
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json().await.ok()
+}
+
+pub(crate) async fn endpoint_responding(port: u16) -> bool {
+    tokio::time::timeout(
+        Duration::from_millis(300),
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
 }

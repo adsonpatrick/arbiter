@@ -10,7 +10,7 @@ use arbiter_storage_sqlite::SqliteEventStore;
 
 use super::{
     Paths, ServerMetadata, VERSION, read_config,
-    status::{daemon_is_current, endpoint_healthy},
+    status::{daemon_is_current, endpoint_responding},
     write_json_atomic,
 };
 
@@ -19,16 +19,16 @@ pub(crate) async fn run(paths: &Paths, foreground: bool) -> anyhow::Result<()> {
     validate_managed_profile(&config.codex_config, config.port)
         .context("validate managed Codex profile")?;
     if foreground {
-        return run_foreground(paths, config.port).await;
+        return run_foreground(paths, &config).await;
     }
-    if daemon_is_current(paths, config.port).await {
+    if daemon_is_current(paths, &config).await {
         println!(
             "Arbiter daemon is already healthy on 127.0.0.1:{}.",
             config.port
         );
         return Ok(());
     }
-    if endpoint_healthy(config.port).await {
+    if endpoint_responding(config.port).await {
         bail!("port {} is serving an unrecognized process", config.port);
     }
     if paths.stop.exists() {
@@ -44,7 +44,7 @@ pub(crate) async fn run(paths: &Paths, foreground: bool) -> anyhow::Result<()> {
     hide_child_window(&mut command);
     let mut child = command.spawn().context("start Arbiter daemon")?;
     for _ in 0..50 {
-        if daemon_is_current(paths, config.port).await {
+        if daemon_is_current(paths, &config).await {
             println!("Arbiter daemon started on 127.0.0.1:{}.", config.port);
             return Ok(());
         }
@@ -57,15 +57,16 @@ pub(crate) async fn run(paths: &Paths, foreground: bool) -> anyhow::Result<()> {
     bail!("Arbiter daemon did not become healthy")
 }
 
-async fn run_foreground(paths: &Paths, port: u16) -> anyhow::Result<()> {
+async fn run_foreground(paths: &Paths, config: &super::LocalConfig) -> anyhow::Result<()> {
     let provider = CodexUpstreamProvider::new().context("initialize Codex upstream provider")?;
     let store = SqliteEventStore::open(&paths.database)
         .await
         .context("open Arbiter event database")?;
     let metadata = ServerMetadata {
         pid: std::process::id(),
-        port,
+        port: config.port,
         version: VERSION.to_owned(),
+        instance_id: config.instance_id.clone(),
     };
     write_json_atomic(&paths.server, &metadata).context("write server metadata")?;
     let stop_marker = paths.stop.clone();
@@ -76,8 +77,8 @@ async fn run_foreground(paths: &Paths, port: u16) -> anyhow::Result<()> {
         }
     };
     let result = serve_local_with_shutdown(
-        AppState::new(provider, store),
-        port,
+        AppState::new_with_identity(provider, store, metadata.clone()),
+        config.port,
         shutdown,
         DEFAULT_SHUTDOWN_GRACE,
     )

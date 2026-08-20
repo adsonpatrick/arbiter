@@ -155,6 +155,7 @@ async fn healthz(State(state): State<AppState>) -> (StatusCode, Json<DaemonHealt
                 detail: None,
             },
         ],
+        identity: state.identity.clone(),
     };
     (http_status, Json(health))
 }

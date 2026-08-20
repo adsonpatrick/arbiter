@@ -6,6 +6,7 @@ use std::{
     },
 };
 
+use arbiter_core::health::DaemonIdentity;
 use arbiter_provider_codex::provider::CodexUpstreamProvider;
 use arbiter_storage_sqlite::SqliteEventStore;
 use tokio::sync::Notify;
@@ -16,15 +17,35 @@ pub struct AppState {
     pub(crate) provider: Arc<CodexUpstreamProvider>,
     pub(crate) store: SqliteEventStore,
     pub(crate) runtime: RuntimeState,
+    pub(crate) identity: DaemonIdentity,
 }
 
 impl AppState {
     #[must_use]
     pub fn new(provider: CodexUpstreamProvider, store: SqliteEventStore) -> Self {
+        Self::new_with_identity(
+            provider,
+            store,
+            DaemonIdentity {
+                pid: std::process::id(),
+                port: 0,
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                instance_id: uuid::Uuid::new_v4().to_string(),
+            },
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_identity(
+        provider: CodexUpstreamProvider,
+        store: SqliteEventStore,
+        identity: DaemonIdentity,
+    ) -> Self {
         Self {
             provider: Arc::new(provider),
             store,
             runtime: RuntimeState::default(),
+            identity,
         }
     }
 

@@ -27,7 +27,16 @@ pub struct ComponentHealth {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonIdentity {
+    pub pid: u32,
+    pub port: u16,
+    pub version: String,
+    pub instance_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonHealth {
     pub status: HealthStatus,
     pub components: Vec<ComponentHealth>,
+    pub identity: DaemonIdentity,
 }

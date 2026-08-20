@@ -1,7 +1,14 @@
 use std::{
-    net::TcpListener,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
     path::Path,
     process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
 };
 
 use tempfile::tempdir;
@@ -32,6 +39,196 @@ fn start_arbiter(home: &Path, codex_home: &Path) -> std::process::ExitStatus {
         .stderr(Stdio::null())
         .status()
         .expect("start arbiter")
+}
+
+fn serve_health_response(
+    listener: TcpListener,
+    body: String,
+) -> (Arc<AtomicBool>, thread::JoinHandle<()>) {
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = Arc::clone(&stop);
+    let server = thread::spawn(move || {
+        while !server_stop.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(300)))
+                        .unwrap();
+                    let mut request = [0_u8; 1_024];
+                    if stream.read(&mut request).unwrap_or(0) > 0 {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept health request: {error}"),
+            }
+        }
+    });
+    (stop, server)
+}
+
+fn daemon_health(port: u16) -> serde_json::Value {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect daemon health");
+    write!(
+        stream,
+        "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write daemon health request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("read daemon health");
+    let body = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| &response[position + 4..])
+        .expect("health response body");
+    serde_json::from_slice(body).expect("parse daemon health")
+}
+
+fn assert_running_identity(arbiter_home: &Path, port: u16) {
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(arbiter_home.join("server.json")).unwrap()).unwrap();
+    let fields = metadata.as_object().unwrap();
+    assert_eq!(fields.len(), 4);
+    assert!(fields.contains_key("pid"));
+    assert_eq!(fields["port"], port);
+    assert_eq!(fields["version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        fields["instance_id"]
+            .as_str()
+            .is_some_and(|instance_id| !instance_id.is_empty())
+    );
+    assert_eq!(daemon_health(port)["identity"], metadata);
+}
+
+#[test]
+fn init_without_port_persists_an_ephemeral_port_and_random_instance() {
+    let temporary = tempdir().unwrap();
+    let arbiter_home = temporary.path().join(".arbiter");
+    let codex_home = temporary.path().join(".codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+
+    let init = arbiter(&arbiter_home, &codex_home, &["init", "codex", "--yes"]);
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(arbiter_home.join("config.json")).unwrap()).unwrap();
+    assert!(config["port"].as_u64().is_some_and(|port| port > 0));
+    assert!(
+        config["instance_id"]
+            .as_str()
+            .is_some_and(|instance_id| !instance_id.is_empty())
+    );
+}
+
+#[test]
+fn stale_metadata_plus_generic_health_is_not_accepted_as_arbiter() {
+    let temporary = tempdir().unwrap();
+    let arbiter_home = temporary.path().join(".arbiter");
+    let codex_home = temporary.path().join(".codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let init = arbiter(
+        &arbiter_home,
+        &codex_home,
+        &["init", "codex", "--yes", "--port", &port.to_string()],
+    );
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(arbiter_home.join("config.json")).unwrap()).unwrap();
+    std::fs::write(
+        arbiter_home.join("server.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "pid": std::process::id(),
+            "port": port,
+            "version": env!("CARGO_PKG_VERSION"),
+            "instance_id": config["instance_id"],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let (stop, server) = serve_health_response(listener, "{}".to_owned());
+
+    let start = arbiter(&arbiter_home, &codex_home, &["start"]);
+    let status = arbiter(&arbiter_home, &codex_home, &["status"]);
+    let doctor = arbiter(&arbiter_home, &codex_home, &["doctor"]);
+    let uninstall = arbiter(&arbiter_home, &codex_home, &["uninstall", "--yes"]);
+    stop.store(true, Ordering::Release);
+    server.join().unwrap();
+    for output in [start, status, doctor, uninstall] {
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized process"));
+    }
+    assert!(arbiter_home.join("install-receipt.json").exists());
+}
+
+#[test]
+fn a_health_identity_mismatch_is_not_accepted_as_arbiter() {
+    let temporary = tempdir().unwrap();
+    let arbiter_home = temporary.path().join(".arbiter");
+    let codex_home = temporary.path().join(".codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let init = arbiter(
+        &arbiter_home,
+        &codex_home,
+        &["init", "codex", "--yes", "--port", &port.to_string()],
+    );
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(arbiter_home.join("config.json")).unwrap()).unwrap();
+    let metadata = serde_json::json!({
+        "pid": std::process::id(),
+        "port": port,
+        "version": env!("CARGO_PKG_VERSION"),
+        "instance_id": config["instance_id"],
+    });
+    std::fs::write(
+        arbiter_home.join("server.json"),
+        serde_json::to_vec(&metadata).unwrap(),
+    )
+    .unwrap();
+    let mismatched_health = serde_json::json!({
+        "status": "healthy",
+        "components": [],
+        "identity": {
+            "pid": metadata["pid"],
+            "port": port,
+            "version": metadata["version"],
+            "instance_id": "wrong-instance",
+        }
+    })
+    .to_string();
+    let (stop, server) = serve_health_response(listener, mismatched_health);
+
+    let start = arbiter(&arbiter_home, &codex_home, &["start"]);
+    stop.store(true, Ordering::Release);
+    server.join().unwrap();
+    assert!(!start.status.success());
+    assert!(String::from_utf8_lossy(&start.stderr).contains("unrecognized process"));
 }
 
 #[test]
@@ -113,13 +310,7 @@ fn init_status_uninstall_lifecycle_is_safe_and_stays_passthrough() {
 
     let start = start_arbiter(&arbiter_home, &codex_home);
     assert!(start.success());
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(arbiter_home.join("server.json")).unwrap()).unwrap();
-    let fields = metadata.as_object().unwrap();
-    assert_eq!(fields.len(), 3);
-    assert!(fields.contains_key("pid"));
-    assert_eq!(fields["port"], port.parse::<u16>().unwrap());
-    assert_eq!(fields["version"], env!("CARGO_PKG_VERSION"));
+    assert_running_identity(&arbiter_home, port.parse().unwrap());
 
     let running_status = arbiter(&arbiter_home, &codex_home, &["status"]);
     assert!(running_status.status.success());

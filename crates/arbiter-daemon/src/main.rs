@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
+use arbiter_core::health::DaemonIdentity;
 use arbiter_daemon::{
     AppState, DEFAULT_SHUTDOWN_GRACE, init_logging, serve_local_with_shutdown, shutdown_signal,
 };
@@ -26,7 +27,16 @@ async fn main() -> anyhow::Result<()> {
         .context("open Arbiter event database")?;
 
     serve_local_with_shutdown(
-        AppState::new(provider, store),
+        AppState::new_with_identity(
+            provider,
+            store,
+            DaemonIdentity {
+                pid: std::process::id(),
+                port: args.port,
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                instance_id: uuid::Uuid::new_v4().to_string(),
+            },
+        ),
         args.port,
         shutdown_signal(),
         DEFAULT_SHUTDOWN_GRACE,

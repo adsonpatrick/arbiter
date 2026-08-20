@@ -12,11 +12,10 @@ use std::{
 
 use anyhow::{Context, bail};
 use arbiter_adapter_codex::InstallReceipt;
-use arbiter_core::config::BaselineTarget;
+use arbiter_core::{config::BaselineTarget, health::DaemonIdentity};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub(crate) const DEFAULT_PORT: u16 = 43_123;
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Parser)]
@@ -33,8 +32,8 @@ enum Command {
         target: InitTarget,
         #[arg(long)]
         yes: bool,
-        #[arg(long, default_value_t = DEFAULT_PORT)]
-        port: u16,
+        #[arg(long)]
+        port: Option<u16>,
     },
     Start {
         #[arg(long, hide = true)]
@@ -73,14 +72,10 @@ pub(crate) struct LocalConfig {
     pub codex_config: PathBuf,
     pub bind_address: String,
     pub remote_export: bool,
+    pub instance_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ServerMetadata {
-    pub pid: u32,
-    pub port: u16,
-    pub version: String,
-}
+pub(crate) type ServerMetadata = DaemonIdentity;
 
 pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
     let paths = Paths::resolve()?;
@@ -115,7 +110,7 @@ impl Paths {
     }
 }
 
-pub(crate) fn default_config(paths: &Paths, port: u16) -> LocalConfig {
+pub(crate) fn default_config(paths: &Paths, port: u16, instance_id: String) -> LocalConfig {
     LocalConfig {
         schema_version: 1,
         mode: "passthrough".to_owned(),
@@ -124,6 +119,7 @@ pub(crate) fn default_config(paths: &Paths, port: u16) -> LocalConfig {
         codex_config: paths.codex_config.clone(),
         bind_address: "127.0.0.1".to_owned(),
         remote_export: false,
+        instance_id,
     }
 }
 
@@ -153,6 +149,8 @@ pub(crate) fn read_config(paths: &Paths) -> anyhow::Result<LocalConfig> {
         || config.codex_config != paths.codex_config
         || config.bind_address != "127.0.0.1"
         || config.remote_export
+        || config.port == 0
+        || config.instance_id.is_empty()
     {
         bail!("local configuration violates the M0 contract");
     }
@@ -167,7 +165,7 @@ pub(crate) fn read_receipt(paths: &Paths) -> anyhow::Result<InstallReceipt> {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, DEFAULT_PORT, InitTarget};
+    use super::{Cli, Command, InitTarget};
 
     #[test]
     fn m0_cli_exposes_only_codex_as_an_init_target() {
@@ -178,7 +176,7 @@ mod tests {
                 target: InitTarget::Codex,
                 yes: true,
                 port,
-            } if port == DEFAULT_PORT
+            } if port.is_none()
         ));
         assert!(Cli::try_parse_from(["arbiter", "init", "openai", "--yes"]).is_err());
     }

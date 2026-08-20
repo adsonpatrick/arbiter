@@ -21,7 +21,10 @@ pub(crate) async fn run(paths: &Paths) -> anyhow::Result<()> {
     store.close().await;
     println!("ok: SQLite integrity");
 
-    if !super::status::daemon_is_current(paths, config.port).await {
+    if !super::status::daemon_is_current(paths, &config).await {
+        if super::status::endpoint_responding(config.port).await {
+            bail!("port {} is serving an unrecognized process", config.port);
+        }
         let listener = TcpListener::bind((config.bind_address.as_str(), config.port))
             .context("local daemon port is unavailable")?;
         drop(listener);
