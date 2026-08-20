@@ -202,63 +202,46 @@ pub fn harden_private_file(path: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 mod windows_acl {
-    use std::{ffi::OsStr, io, path::Path, process::Command};
+    use std::{io, path::Path};
 
-    fn run(script: &str, environment: &[(&str, &OsStr)]) -> io::Result<String> {
-        let system_root = std::env::var_os("SystemRoot")
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SystemRoot is unavailable"))?;
-        let executable = Path::new(&system_root)
-            .join("System32")
-            .join("WindowsPowerShell")
-            .join("v1.0")
-            .join("powershell.exe");
-        let mut command = Command::new(executable);
-        command.env_clear().env("SystemRoot", &system_root);
-        for name in ["WINDIR", "TEMP", "TMP"] {
-            if let Some(value) = std::env::var_os(name) {
-                command.env(name, value);
-            }
-        }
-        command.args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            script,
-        ]);
-        for (name, value) in environment {
-            command.env(name, value);
-        }
-        let output = command.output()?;
-        if output.status.code() == Some(13) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "the original Windows ACL is too restrictive for atomic management",
-            ));
-        }
-        if !output.status.success() {
-            return Err(io::Error::other("Windows ACL operation failed"));
-        }
-        String::from_utf8(output.stdout)
-            .map(|value| value.trim().to_owned())
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    use windows_permissions::{
+        LocalBox, SecurityDescriptor, Trustee,
+        constants::{AceType, SeObjectType, SecurityInformation},
+        utilities::current_process_sid,
+        wrappers::{
+            ConvertSecurityDescriptorToStringSecurityDescriptor, GetNamedSecurityInfo,
+            SetNamedSecurityInfo,
+        },
+    };
+
+    const FILE_MODIFY: u32 = 0x0003_01BF;
+
+    fn parse_sddl(sddl: &str) -> io::Result<LocalBox<SecurityDescriptor>> {
+        sddl.parse()
+    }
+
+    fn dacl_is_protected(sddl: &str) -> bool {
+        let Some((_, dacl)) = sddl.split_once("D:") else {
+            return false;
+        };
+        let first_ace = dacl.find('(').unwrap_or(dacl.len());
+        let next_section = dacl.find("S:").unwrap_or(dacl.len());
+        let control_end = first_ace.min(next_section);
+        dacl[..control_end].contains('P')
+    }
+
+    fn is_allow_ace(ace_type: AceType) -> bool {
+        matches!(
+            ace_type,
+            AceType::ACCESS_ALLOWED_ACE_TYPE
+                | AceType::ACCESS_ALLOWED_CALLBACK_ACE_TYPE
+                | AceType::ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE
+                | AceType::ACCESS_ALLOWED_OBJECT_ACE_TYPE
+        )
     }
 
     pub(super) fn private_sddl() -> io::Result<String> {
-        let sid = run(
-            "& { [Console]::Out.Write([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) }",
-            &[],
-        )?;
-        if !sid.starts_with("S-")
-            || !sid
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || byte == b'S' || byte == b'-')
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Windows returned an invalid user SID",
-            ));
-        }
+        let sid = current_process_sid()?;
         Ok(format!("D:P(A;;FA;;;{sid})"))
     }
 
@@ -266,28 +249,65 @@ mod windows_acl {
         let Some(original) = original else {
             return private_sddl();
         };
-        run(
-            "& { $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $applicable = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase); [void]$applicable.Add($identity.User.Value); foreach ($group in $identity.Groups) { [void]$applicable.Add($group.Value) }; $source = [Security.AccessControl.FileSecurity]::new(); $source.SetSecurityDescriptorSddlForm($env:ARBITER_ACL_ORIGINAL); [long]$allowed = 0; [long]$denied = 0; foreach ($rule in $source.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) { if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny) { if ($applicable.Contains($rule.IdentityReference.Value)) { $denied = $denied -bor [long]$rule.FileSystemRights } } elseif ($rule.IdentityReference.Value -eq $identity.User.Value) { $allowed = $allowed -bor [long]$rule.FileSystemRights } }; [long]$effective = $allowed -band (-bnot $denied); [long]$required = [long][Security.AccessControl.FileSystemRights]::Modify; if (($effective -band $required) -ne $required) { exit 13 }; $restricted = [Security.AccessControl.FileSecurity]::new(); $restricted.SetAccessRuleProtection($true, $false); if ($denied -ne 0) { $restricted.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity.User, [Security.AccessControl.FileSystemRights]$denied, [Security.AccessControl.AccessControlType]::Deny)) }; $restricted.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity.User, [Security.AccessControl.FileSystemRights]$effective, [Security.AccessControl.AccessControlType]::Allow)); [Console]::Out.Write($restricted.Sddl) }",
-            &[("ARBITER_ACL_ORIGINAL", OsStr::new(original))],
-        )
+        let descriptor = parse_sddl(original)?;
+        let dacl = descriptor
+            .dacl()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Windows ACL has no DACL"))?;
+        let identity = current_process_sid()?;
+        let mut direct_allowed = 0_u32;
+        for index in 0..dacl.len() {
+            let ace = dacl
+                .get_ace(index)
+                .expect("an ACE below the reported DACL length must exist");
+            if is_allow_ace(ace.ace_type()) && ace.sid() == Some(identity.as_ref()) {
+                direct_allowed |= ace.mask().bits();
+            }
+        }
+        let trustee = Trustee::from(identity.as_ref());
+        let effective = direct_allowed & dacl.effective_rights(&trustee)?.bits();
+        if effective & FILE_MODIFY != FILE_MODIFY {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the original Windows ACL is too restrictive for atomic management",
+            ));
+        }
+        Ok(format!("D:P(A;;0x{effective:08x};;;{identity})"))
     }
 
     pub(super) fn capture_dacl(path: &Path) -> io::Result<String> {
-        run(
-            "& { [Console]::Out.Write((Get-Acl -LiteralPath $env:ARBITER_ACL_PATH).Sddl) }",
-            &[("ARBITER_ACL_PATH", path.as_os_str())],
-        )
+        let information =
+            SecurityInformation::Owner | SecurityInformation::Group | SecurityInformation::Dacl;
+        let descriptor =
+            GetNamedSecurityInfo(path.as_os_str(), SeObjectType::SE_FILE_OBJECT, information)?;
+        ConvertSecurityDescriptorToStringSecurityDescriptor(&descriptor, information)?
+            .into_string()
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows returned non-Unicode SDDL",
+                )
+            })
     }
 
     pub(super) fn apply_sddl(path: &Path, sddl: &str) -> io::Result<()> {
-        run(
-            "& { $acl = Get-Acl -LiteralPath $env:ARBITER_ACL_PATH; $acl.SetSecurityDescriptorSddlForm($env:ARBITER_ACL_SDDL, [Security.AccessControl.AccessControlSections]::Access); Set-Acl -LiteralPath $env:ARBITER_ACL_PATH -AclObject $acl }",
-            &[
-                ("ARBITER_ACL_PATH", path.as_os_str()),
-                ("ARBITER_ACL_SDDL", OsStr::new(sddl)),
-            ],
+        let descriptor = parse_sddl(sddl)?;
+        let dacl = descriptor
+            .dacl()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Windows ACL has no DACL"))?;
+        let protection = if dacl_is_protected(sddl) {
+            SecurityInformation::ProtectedDacl
+        } else {
+            SecurityInformation::UnprotectedDacl
+        };
+        SetNamedSecurityInfo(
+            path.as_os_str(),
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Dacl | protection,
+            None,
+            None,
+            Some(dacl),
+            None,
         )
-        .map(|_| ())
     }
 }
 
