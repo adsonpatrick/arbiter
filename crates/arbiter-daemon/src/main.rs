@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-use arbiter_daemon::{AppState, serve_local};
+use arbiter_daemon::{AppState, init_logging, serve_local};
 use arbiter_provider_codex::provider::CodexUpstreamProvider;
 use arbiter_storage_sqlite::SqliteEventStore;
 use clap::Parser;
@@ -17,6 +17,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    init_logging().context("initialize structured logging")?;
     let provider = CodexUpstreamProvider::new().context("initialize Codex upstream provider")?;
     let store = SqliteEventStore::open(&args.database)
         .await

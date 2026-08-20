@@ -40,8 +40,25 @@ pub(crate) async fn responses(
     });
 
     if state.store.append(&started).await.is_err() {
+        tracing::warn!(
+            event_type = "attempt_start_failed",
+            request_id = %context.request_id,
+            attempt_id = %context.attempt_id,
+            model = %context.target.model,
+            reasoning_effort = "medium",
+            http_status = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            "Arbiter attempt event"
+        );
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
+    tracing::info!(
+        event_type = "attempt_started",
+        request_id = %context.request_id,
+        attempt_id = %context.attempt_id,
+        model = %context.target.model,
+        reasoning_effort = "medium",
+        "Arbiter attempt event"
+    );
 
     let upstream = match state.provider.forward(&headers, request).await {
         Ok(upstream) => upstream,
@@ -52,6 +69,7 @@ pub(crate) async fn responses(
             };
             let failed = context.failed(error_class);
             let _ = state.store.append(&failed).await;
+            log_terminal_event(&failed, Some(StatusCode::BAD_GATEWAY));
             return response_with_attempt(StatusCode::BAD_GATEWAY, context.attempt_id);
         }
     };
@@ -156,8 +174,44 @@ impl GovernedStream {
         self.terminal_recorded = true;
         let store = self.store.clone();
         tokio::spawn(async move {
-            let _ = store.append(&event).await;
+            if store.append(&event).await.is_ok() {
+                log_terminal_event(&event, None);
+            }
         });
+    }
+}
+
+fn log_terminal_event(event: &GovernorEvent, http_status: Option<StatusCode>) {
+    match &event.kind {
+        arbiter_core::events::GovernorEventKind::AttemptCompleted(completed) => {
+            tracing::info!(
+                event_type = "attempt_completed",
+                request_id = %completed.request_id,
+                attempt_id = %completed.attempt_id,
+                model = %completed.target.model,
+                reasoning_effort = "medium",
+                duration_ms = completed.duration_ms,
+                input_tokens = completed.usage.input_tokens,
+                cached_input_tokens = completed.usage.cached_input_tokens,
+                output_tokens = completed.usage.output_tokens,
+                reasoning_tokens = completed.usage.reasoning_tokens,
+                "Arbiter attempt event"
+            );
+        }
+        arbiter_core::events::GovernorEventKind::AttemptFailed(failed) => {
+            tracing::warn!(
+                event_type = "attempt_failed",
+                request_id = %failed.request_id,
+                attempt_id = %failed.attempt_id,
+                model = %failed.target.model,
+                reasoning_effort = "medium",
+                duration_ms = failed.duration_ms,
+                error_class = ?failed.error_class,
+                http_status = http_status.map(|status| status.as_u16()),
+                "Arbiter attempt event"
+            );
+        }
+        arbiter_core::events::GovernorEventKind::AttemptStarted(_) => {}
     }
 }
 
