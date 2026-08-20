@@ -62,7 +62,10 @@ async fn stop_daemon(paths: &Paths, config: &super::LocalConfig) -> anyhow::Resu
     }
     let metadata: ServerMetadata = read_json(&paths.server)?;
     if !daemon_is_current(paths, config).await {
-        if endpoint_responding(metadata.port).await {
+        if endpoint_responding(config.port).await {
+            anyhow::bail!("port {} is serving an unrecognized process", config.port);
+        }
+        if metadata.port != config.port && endpoint_responding(metadata.port).await {
             anyhow::bail!("port {} is serving an unrecognized process", metadata.port);
         }
         std::fs::remove_file(&paths.server).context("remove stale server metadata")?;
@@ -148,6 +151,39 @@ mod tests {
             listener.local_addr().unwrap().port(),
             "test-instance".to_owned(),
         );
+
+        let error = stop_daemon(&paths, &config).await.unwrap_err();
+
+        assert!(error.to_string().contains("unrecognized process"));
+    }
+
+    #[tokio::test]
+    async fn rejects_an_occupied_configured_port_when_metadata_names_another_port() {
+        let temporary = tempdir().unwrap();
+        let arbiter_home = temporary.path().join(".arbiter");
+        std::fs::create_dir_all(&arbiter_home).unwrap();
+        let paths = Paths {
+            codex_config: temporary.path().join(".codex/config.toml"),
+            config: arbiter_home.join("config.json"),
+            database: arbiter_home.join("arbiter.db"),
+            receipt: arbiter_home.join("install-receipt.json"),
+            server: arbiter_home.join("server.json"),
+            stop: arbiter_home.join("stop"),
+            arbiter_home,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = default_config(
+            &paths,
+            listener.local_addr().unwrap().port(),
+            "test-instance".to_owned(),
+        );
+        let metadata = crate::commands::ServerMetadata {
+            pid: 1,
+            port: config.port.saturating_add(1),
+            version: crate::commands::VERSION.to_owned(),
+            instance_id: config.instance_id.clone(),
+        };
+        crate::commands::write_json_atomic(&paths.server, &metadata).unwrap();
 
         let error = stop_daemon(&paths, &config).await.unwrap_err();
 
