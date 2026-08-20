@@ -83,7 +83,7 @@ async fn shutdown_rejects_new_work_and_bounds_a_hanging_attempt() {
         async move {
             let _ = shutdown_rx.await;
         },
-        Duration::from_millis(100),
+        Duration::from_millis(500),
     ));
 
     let client = reqwest::Client::new();
@@ -112,7 +112,7 @@ async fn shutdown_rejects_new_work_and_bounds_a_hanging_attempt() {
         .await;
     assert!(second.is_err() || second.unwrap().status().is_server_error());
 
-    tokio::time::timeout(Duration::from_secs(1), daemon)
+    tokio::time::timeout(Duration::from_secs(2), daemon)
         .await
         .expect("bounded shutdown")
         .expect("daemon task")

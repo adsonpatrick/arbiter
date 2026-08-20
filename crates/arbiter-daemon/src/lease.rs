@@ -23,20 +23,33 @@ impl DaemonLease {
         lock_name.push(".lock");
         let path = database.with_file_name(lock_name);
         let lock_existed = path.exists();
-        let file = open_file(&path)?;
+        let file =
+            open_file(&path).map_err(|error| contextualize("open lock file", &path, &error))?;
         if !lock_existed {
-            protect_file(&file, &path)?;
+            protect_file(&file, &path)
+                .map_err(|error| contextualize("protect new lock file", &path, &error))?;
         }
         fs2::FileExt::try_lock_exclusive(&file)?;
-        protect_file(&file, &path)?;
-        drop(open_private(database)?);
+        protect_file(&file, &path)
+            .map_err(|error| contextualize("protect lock file", &path, &error))?;
+        drop(
+            open_private(database)
+                .map_err(|error| contextualize("open private database", database, &error))?,
+        );
         Ok(Self { _file: file })
     }
 }
 
+fn contextualize(operation: &str, path: &Path, error: &io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("{operation} {}: {error}", path.display()),
+    )
+}
+
 fn open_private(path: &Path) -> io::Result<File> {
-    let file = open_file(path)?;
-    protect_file(&file, path)?;
+    let file = open_file(path).map_err(|error| contextualize("open file", path, &error))?;
+    protect_file(&file, path).map_err(|error| contextualize("protect file", path, &error))?;
     Ok(file)
 }
 
@@ -53,81 +66,95 @@ fn open_file(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
+#[cfg(unix)]
+fn protect_file(file: &File, _path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(windows)]
 fn protect_file(_file: &File, path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        _file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(windows)]
-    windows_acl::protect(path)?;
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (_file, path);
-    }
+    windows_acl::protect(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn protect_file(_file: &File, _path: &Path) -> io::Result<()> {
     Ok(())
 }
 
 #[cfg(windows)]
 mod windows_acl {
-    use std::{io, path::Path, process::Command};
+    use std::{fs::OpenOptions, io, path::Path};
 
-    fn run(script: &str, path: &Path) -> io::Result<String> {
-        let system_root = std::env::var_os("SystemRoot")
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SystemRoot is unavailable"))?;
-        let executable = Path::new(&system_root)
-            .join("System32")
-            .join("WindowsPowerShell")
-            .join("v1.0")
-            .join("powershell.exe");
-        let mut command = Command::new(executable);
-        command
-            .env_clear()
-            .env("SystemRoot", &system_root)
-            .env("ARBITER_SECURE_PATH", path.as_os_str())
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                script,
-            ]);
-        for name in ["WINDIR", "TEMP", "TMP"] {
-            if let Some(value) = std::env::var_os(name) {
-                command.env(name, value);
-            }
-        }
-        let output = command.output()?;
-        if !output.status.success() {
-            return Err(io::Error::other("Windows database ACL operation failed"));
-        }
-        String::from_utf8(output.stdout)
-            .map(|value| value.trim().to_owned())
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    use windows_permissions::{
+        LocalBox, SecurityDescriptor,
+        constants::{SeObjectType, SecurityInformation},
+        utilities::current_process_sid,
+        wrappers::SetNamedSecurityInfo,
+    };
+
+    #[cfg(test)]
+    use windows_permissions::wrappers::{
+        ConvertSecurityDescriptorToStringSecurityDescriptor, GetNamedSecurityInfo,
+    };
+
+    fn private_descriptor(inherit_to_children: bool) -> io::Result<LocalBox<SecurityDescriptor>> {
+        let inheritance = if inherit_to_children { "OICI" } else { "" };
+        format!("D:P(A;{inheritance};FA;;;{})", current_process_sid()?).parse()
     }
 
     pub(super) fn protect(path: &Path) -> io::Result<()> {
-        run(
-            "& { $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $acl = Get-Acl -LiteralPath $env:ARBITER_SECURE_PATH; $acl.SetSecurityDescriptorSddlForm(\"D:P(A;;FA;;;$sid)\", [Security.AccessControl.AccessControlSections]::Access); Set-Acl -LiteralPath $env:ARBITER_SECURE_PATH -AclObject $acl }",
-            path,
+        apply_private_descriptor(path, false)
+    }
+
+    fn protect_directory(path: &Path) -> io::Result<()> {
+        apply_private_descriptor(path, true)
+    }
+
+    fn apply_private_descriptor(path: &Path, inherit_to_children: bool) -> io::Result<()> {
+        let descriptor = private_descriptor(inherit_to_children)?;
+        let dacl = descriptor
+            .dacl()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "private ACL has no DACL"))?;
+        SetNamedSecurityInfo(
+            path.as_os_str(),
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
+            None,
+            None,
+            Some(dacl),
+            None,
         )
-        .map(|_| ())
     }
 
     pub(super) fn create_private(path: &Path) -> io::Result<()> {
-        run(
-            "& { $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $security = [Security.AccessControl.FileSecurity]::new(); $security.SetAccessRuleProtection($true, $false); $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity.User, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow)); $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete; $stream = [IO.FileStream]::new($env:ARBITER_SECURE_PATH, [IO.FileMode]::OpenOrCreate, [Security.AccessControl.FileSystemRights]::FullControl, $share, 1, [IO.FileOptions]::None, $security); $stream.Dispose() }",
-            path,
-        )
-        .map(|_| ())
+        if path.exists() {
+            return Ok(());
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+        protect_directory(parent)?;
+        match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(_) => protect(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => protect(path),
+            Err(error) => Err(error),
+        }
     }
 
     #[cfg(test)]
     pub(super) fn capture(path: &Path) -> io::Result<String> {
-        run(
-            "& { [Console]::Out.Write((Get-Acl -LiteralPath $env:ARBITER_SECURE_PATH).Sddl) }",
-            path,
-        )
+        let information = SecurityInformation::Dacl;
+        let descriptor =
+            GetNamedSecurityInfo(path.as_os_str(), SeObjectType::SE_FILE_OBJECT, information)?;
+        ConvertSecurityDescriptorToStringSecurityDescriptor(&descriptor, information)?
+            .into_string()
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows returned non-Unicode SDDL",
+                )
+            })
     }
 }
 
@@ -136,6 +163,24 @@ mod tests {
     use tempfile::tempdir;
 
     use super::DaemonLease;
+
+    #[cfg(windows)]
+    fn has_single_protected_full_control_ace(sddl: &str) -> bool {
+        let dacl = sddl.strip_prefix("D:").unwrap_or(sddl);
+        let first_ace = dacl.find('(').unwrap_or(dacl.len());
+        let (control, aces) = dacl.split_at(first_ace);
+        let control = control.replace("AI", "");
+        if control != "P" {
+            return false;
+        }
+        let Some(ace) = aces.strip_prefix("(A;;FA;;;") else {
+            return false;
+        };
+        let Some((principal, remainder)) = ace.split_once(')') else {
+            return false;
+        };
+        !principal.is_empty() && !remainder.contains('(')
+    }
 
     #[test]
     fn only_one_process_lease_can_own_a_database() {
@@ -177,8 +222,10 @@ mod tests {
 
         for path in [&database, &lock] {
             let sddl = super::windows_acl::capture(path).unwrap();
-            assert!(sddl.contains("D:P"));
-            assert!(sddl.contains(";;FA;;;S-"));
+            assert!(
+                has_single_protected_full_control_ace(&sddl),
+                "unexpected private file DACL: {sddl}"
+            );
         }
     }
 
@@ -191,7 +238,9 @@ mod tests {
         super::windows_acl::create_private(&path).unwrap();
 
         let sddl = super::windows_acl::capture(&path).unwrap();
-        assert!(sddl.contains("D:P"));
-        assert!(sddl.contains(";;FA;;;S-"));
+        assert!(
+            has_single_protected_full_control_ace(&sddl),
+            "unexpected private file DACL: {sddl}"
+        );
     }
 }

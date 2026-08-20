@@ -13,5 +13,8 @@ tempfile.workspace = true
 thiserror.workspace = true
 toml_edit.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-permissions = "0.2.4"
+
 [lints]
 workspace = true
