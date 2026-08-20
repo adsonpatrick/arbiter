@@ -121,6 +121,27 @@ impl SqliteEventStore {
             .collect()
     }
 
+    /// Reads the lifecycle events for the most recently started attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query fails or a stored event cannot be decoded.
+    pub async fn latest_attempt_events(&self) -> Result<Vec<GovernorEvent>, StoreError> {
+        let payloads = sqlx::query_scalar::<_, String>(
+            "SELECT payload_json FROM governor_events \
+             WHERE attempt_id = (\
+                 SELECT attempt_id FROM governor_events \
+                 WHERE event_type = 'attempt_started' ORDER BY rowid DESC LIMIT 1\
+             ) ORDER BY rowid",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        payloads
+            .into_iter()
+            .map(|payload| serde_json::from_str(&payload).map_err(StoreError::from))
+            .collect()
+    }
+
     /// Runs `SQLite`'s full database integrity check.
     ///
     /// # Errors
@@ -237,7 +258,7 @@ mod tests {
                 .events_for_attempt(attempt_id)
                 .await
                 .expect("read events"),
-            vec![started, completed]
+            vec![started.clone(), completed.clone()]
         );
         assert_eq!(
             reopened
@@ -249,6 +270,13 @@ mod tests {
                 completed: 1,
                 failed: 0,
             }
+        );
+        assert_eq!(
+            reopened
+                .latest_attempt_events()
+                .await
+                .expect("latest attempt"),
+            vec![started, completed]
         );
     }
 

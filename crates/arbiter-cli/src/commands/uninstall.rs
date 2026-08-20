@@ -36,13 +36,15 @@ fn require_safe_backup_paths(
     receipt: &arbiter_adapter_codex::InstallReceipt,
 ) -> anyhow::Result<()> {
     let backup_root = paths.arbiter_home.join("backups").canonicalize()?;
-    let backup = receipt.backup_path.canonicalize()?;
-    let hash = receipt.backup_hash_path.canonicalize()?;
-    if !backup.starts_with(&backup_root)
-        || !hash.starts_with(&backup_root)
-        || receipt.backup_hash_path != receipt.backup_path.with_extension("toml.sha256")
-    {
-        anyhow::bail!("installation receipt points outside the Arbiter backup directory");
+    for managed in [&receipt.config, &receipt.profile] {
+        let backup = managed.backup_path.canonicalize()?;
+        let hash = managed.backup_hash_path.canonicalize()?;
+        if !backup.starts_with(&backup_root)
+            || !hash.starts_with(&backup_root)
+            || managed.backup_hash_path != managed.backup_path.with_extension("toml.sha256")
+        {
+            anyhow::bail!("installation receipt points outside the Arbiter backup directory");
+        }
     }
     Ok(())
 }
@@ -74,7 +76,7 @@ async fn stop_daemon(paths: &Paths) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use arbiter_adapter_codex::InstallReceipt;
+    use arbiter_adapter_codex::{InstallReceipt, ManagedFileReceipt};
     use tempfile::tempdir;
 
     use super::{Paths, require_safe_backup_paths};
@@ -97,12 +99,17 @@ mod tests {
             stop: arbiter_home.join("stop"),
             arbiter_home,
         };
-        let receipt = InstallReceipt {
+        let outside_receipt = ManagedFileReceipt {
+            path: paths.codex_config.clone(),
             backup_path: outside,
             backup_hash_path: outside_hash,
             original_sha256: "hash".to_owned(),
             installed_sha256: "hash".to_owned(),
             original_existed: true,
+        };
+        let receipt = InstallReceipt {
+            config: outside_receipt.clone(),
+            profile: outside_receipt,
         };
 
         assert!(require_safe_backup_paths(&paths, &receipt).is_err());

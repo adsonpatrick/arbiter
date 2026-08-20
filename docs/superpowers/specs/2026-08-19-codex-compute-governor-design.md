@@ -1,6 +1,6 @@
 # Arbiter — Design Specification
 
-**Status:** Approved v0.3 — Codex-Managed Authentication Amendment Applied
+**Status:** Approved v0.4 — Codex Profile-File Contract Amendment Applied
 **Date:** 2026-08-19  
 **Scope:** Codex-first, OpenAI-first, local-first open-source compute governance  
 **Document type:** Canonical architectural design specification
@@ -123,6 +123,8 @@ Untrusted content may contribute semantic signals but cannot expand budgets, inc
 ### 4.3 Codex-managed authentication boundary
 
 M0 does not create, request, read, refresh, or persist an OpenAI API key. The managed Codex provider sets `requires_openai_auth = true`, so Codex uses its existing ChatGPT subscription login and sends the resulting authorization on the localhost request. Codex remains the credential owner and refresh authority. API-key-authenticated Codex sessions are outside M0 because they use a different upstream contract.
+
+For Codex 0.134.0 and later, Arbiter installs the provider table in `$CODEX_HOME/config.toml` and the Terra/Medium selection as top-level keys in `$CODEX_HOME/arbiter.config.toml`. `codex exec --profile arbiter` loads that named file as a layer. Arbiter does not install the removed legacy `[profiles.arbiter]` table or change a default profile selector. Both managed files are backed up, hash-verified, conflict-checked, and restored to their exact previous existence/content state.
 
 Arbiter may hold the incoming authorization value in memory only long enough to forward that request to the pinned Codex upstream. It MUST NOT read `~/.codex/auth.json`, query the operating-system credential store, write credentials to Arbiter configuration, or expose credential values through CLI output, logs, events, errors, metrics, or remote sinks.
 
@@ -539,6 +541,8 @@ A failed contract probe narrows/amends the milestone rather than being hidden by
 Adversarial self-review corrected: undefined runtime Task usage; conflation of production and learning cost; oversimplified trust hierarchy; replay missing dynamic provider/pricing/config inputs; pricing as target identity; verifier command authorization ambiguity; unrealizable atomic-activation semantics; coarse event privacy classification; ambiguous fresh-install mode; ambiguous performance-SLO scope; master design too broad for one implementation plan; and external contract assumptions requiring fresh verification.
 
 The v0.3 amendment removed the M0 assumption that Arbiter owns an OpenAI API key. M0 now reuses Codex-managed authentication through `requires_openai_auth = true`, constrains credential forwarding to the verified Codex upstream, and validates direct Codex versus Codex-through-Arbiter behavior.
+
+The v0.4 amendment records the Codex 0.134+ profile-file contract discovered during the live-contract gate. Named profiles are separate `$CODEX_HOME/<name>.config.toml` layers; legacy `[profiles.<name>]` tables are not used.
 
 No unresolved contradiction remains intentionally in this approved draft. Future material changes require explicit amendments.
 

@@ -228,10 +228,10 @@ docs/
 **Managed names:** provider `arbiter`, profile `arbiter`.
 
 - [ ] Test config containing unrelated providers/comments/settings: install Arbiter, preserve unrelated TOML, uninstall, restore from verified backup.
-- [ ] Use `toml_edit` to add a Responses provider pointing to `http://127.0.0.1:PORT/v1` with `requires_openai_auth = true`, `request_max_retries = 0`, and `stream_max_retries = 0` plus an Arbiter profile with Terra/Medium. Do not add `env_key` or an embedded bearer token.
+- [ ] Use `toml_edit` to add a Responses provider to `$CODEX_HOME/config.toml` pointing to `http://127.0.0.1:PORT/v1` with `requires_openai_auth = true`, `request_max_retries = 0`, and `stream_max_retries = 0`. Install Terra/Medium as top-level keys in the Codex 0.134+ named layer `$CODEX_HOME/arbiter.config.toml`; do not use the removed legacy `[profiles.arbiter]` table. Do not add `env_key` or an embedded bearer token.
 - [ ] Do not change the user's default Codex profile automatically.
-- [ ] Write backup to `~/.arbiter/backups/codex-config-<timestamp>.toml`, close/fsync it, then update config through temp file + same-filesystem atomic rename.
-- [ ] Store/verify backup hash. If config changed after Arbiter install, report conflict rather than silently overwriting newer user changes.
+- [ ] Write backups for both `config.toml` and the prior existence/content state of `arbiter.config.toml` under `~/.arbiter/backups`, close/fsync them, then update each target through a temp file + same-filesystem atomic rename.
+- [ ] Store/verify both backup hashes. If either managed file changed after Arbiter install, report conflict rather than silently overwriting newer user changes.
 - [ ] Run adapter and roundtrip tests.
 - [ ] Commit: `feat: manage codex arbiter profile safely`.
 

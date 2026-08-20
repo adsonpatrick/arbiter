@@ -77,11 +77,12 @@ fn init_status_uninstall_lifecycle_is_safe_and_stays_passthrough() {
     assert!(arbiter_home.join("arbiter.db").exists());
     assert!(arbiter_home.join("install-receipt.json").exists());
     let installed = std::fs::read_to_string(&codex_config).unwrap();
+    let profile = std::fs::read_to_string(codex_home.join("arbiter.config.toml")).unwrap();
     assert!(installed.contains("[model_providers.arbiter]"));
-    assert!(installed.contains("[profiles.arbiter]"));
+    assert!(!installed.contains("[profiles.arbiter]"));
     assert!(installed.contains("requires_openai_auth = true"));
-    assert!(installed.contains("model = \"gpt-5.6-terra\""));
-    assert!(installed.contains("model_reasoning_effort = \"medium\""));
+    assert!(profile.contains("model = \"gpt-5.6-terra\""));
+    assert!(profile.contains("model_reasoning_effort = \"medium\""));
     assert!(installed.starts_with("# user config\nprofile = \"daily\""));
     for entry in std::fs::read_dir(&arbiter_home).unwrap() {
         let entry = entry.unwrap();
@@ -137,5 +138,6 @@ fn init_status_uninstall_lifecycle_is_safe_and_stays_passthrough() {
     assert!(arbiter_home.join("arbiter.db").exists());
     assert!(!arbiter_home.join("install-receipt.json").exists());
     assert!(!arbiter_home.join("server.json").exists());
+    assert!(!codex_home.join("arbiter.config.toml").exists());
     assert!(String::from_utf8_lossy(&uninstall.stdout).contains("arbiter.db"));
 }
