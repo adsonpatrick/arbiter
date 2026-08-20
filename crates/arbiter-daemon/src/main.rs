@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-use arbiter_daemon::{AppState, init_logging, serve_local};
+use arbiter_daemon::{
+    AppState, DEFAULT_SHUTDOWN_GRACE, init_logging, serve_local_with_shutdown, shutdown_signal,
+};
 use arbiter_provider_codex::provider::CodexUpstreamProvider;
 use arbiter_storage_sqlite::SqliteEventStore;
 use clap::Parser;
@@ -23,9 +25,14 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("open Arbiter event database")?;
 
-    serve_local(AppState::new(provider, store), args.port)
-        .await
-        .context("serve Arbiter daemon")
+    serve_local_with_shutdown(
+        AppState::new(provider, store),
+        args.port,
+        shutdown_signal(),
+        DEFAULT_SHUTDOWN_GRACE,
+    )
+    .await
+    .context("serve Arbiter daemon")
 }
 
 #[cfg(test)]

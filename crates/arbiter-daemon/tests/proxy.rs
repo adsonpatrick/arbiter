@@ -417,6 +417,16 @@ async fn upstream_connect_failure_records_provider_connect() {
             .unwrap(),
     );
     let events = store.events_for_attempt(attempt_id).await.unwrap();
+    assert_eq!(
+        events.len(),
+        2,
+        "a connect failure must not retry or fall back"
+    );
+    let GovernorEventKind::AttemptStarted(started) = &events[0].kind else {
+        panic!("first event must start the only attempt");
+    };
+    assert_eq!(started.attempt_index, 0);
+    assert_eq!(started.target, arbiter_core::config::BaselineTarget::m0());
     let GovernorEventKind::AttemptFailed(failed) = &events[1].kind else {
         panic!("connect error must fail the attempt");
     };
@@ -424,6 +434,8 @@ async fn upstream_connect_failure_records_provider_connect() {
         failed.error_class,
         arbiter_core::events::ErrorClass::ProviderConnect
     );
+    assert_eq!(failed.attempt_index, 0);
+    assert_eq!(failed.target, arbiter_core::config::BaselineTarget::m0());
 }
 
 #[tokio::test]

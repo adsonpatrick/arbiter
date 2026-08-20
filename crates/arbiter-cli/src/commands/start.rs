@@ -2,7 +2,9 @@ use std::{process::Stdio, time::Duration};
 
 use anyhow::{Context, bail};
 use arbiter_adapter_codex::validate_managed_profile;
-use arbiter_daemon::{AppState, serve_local};
+use arbiter_daemon::{
+    AppState, DEFAULT_SHUTDOWN_GRACE, serve_local_with_shutdown, shutdown_signal,
+};
 use arbiter_provider_codex::provider::CodexUpstreamProvider;
 use arbiter_storage_sqlite::SqliteEventStore;
 
@@ -66,21 +68,30 @@ async fn run_foreground(paths: &Paths, port: u16) -> anyhow::Result<()> {
         version: VERSION.to_owned(),
     };
     write_json_atomic(&paths.server, &metadata).context("write server metadata")?;
-    let server = serve_local(AppState::new(provider, store), port);
-    tokio::pin!(server);
-    loop {
+    let stop_marker = paths.stop.clone();
+    let shutdown = async move {
         tokio::select! {
-            result = &mut server => {
-                remove_server_metadata(paths)?;
-                return result.context("serve Arbiter daemon");
-            }
-            () = tokio::time::sleep(Duration::from_millis(100)) => {
-                if paths.stop.exists() {
-                    remove_server_metadata(paths)?;
-                    return Ok(());
-                }
-            }
+            () = shutdown_signal() => {}
+            () = wait_for_stop_marker(stop_marker) => {}
         }
+    };
+    let result = serve_local_with_shutdown(
+        AppState::new(provider, store),
+        port,
+        shutdown,
+        DEFAULT_SHUTDOWN_GRACE,
+    )
+    .await;
+    remove_server_metadata(paths)?;
+    result.context("serve Arbiter daemon")
+}
+
+async fn wait_for_stop_marker(path: std::path::PathBuf) {
+    loop {
+        if path.exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

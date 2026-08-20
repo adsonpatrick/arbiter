@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     pin::Pin,
     task::{Context, Poll},
     time::{SystemTime, UNIX_EPOCH},
@@ -23,13 +24,19 @@ use axum::{
 use bytes::Bytes;
 use futures_util::Stream;
 
-use crate::AppState;
+use crate::{
+    AppState,
+    state::{RequestActivity, RuntimeState},
+};
 
 pub(crate) async fn responses(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<serde_json::Value>,
 ) -> Response {
+    let Some(activity) = state.start_request() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     let context = AttemptContext::new();
     let started = GovernorEvent::attempt_started(AttemptStarted {
         request_id: context.request_id,
@@ -74,7 +81,7 @@ pub(crate) async fn responses(
         }
     };
 
-    proxy_response(upstream, state.store, context)
+    proxy_response(upstream, state.store, state.runtime, context, activity)
 }
 
 fn response_with_attempt(status: StatusCode, attempt_id: AttemptId) -> Response {
@@ -90,7 +97,9 @@ fn response_with_attempt(status: StatusCode, attempt_id: AttemptId) -> Response 
 fn proxy_response(
     upstream: ProviderResponse,
     store: SqliteEventStore,
+    runtime: RuntimeState,
     context: AttemptContext,
+    activity: RequestActivity,
 ) -> Response {
     let status = upstream.status;
     let mut response_headers = upstream.headers.clone();
@@ -99,11 +108,15 @@ fn proxy_response(
         HeaderValue::from_str(&context.attempt_id.to_string())
             .expect("UUID is always a valid header value"),
     );
+    let force_cancelled = Box::pin(runtime.cancellation_token().cancelled_owned());
     let stream = GovernedStream {
         upstream: upstream.bytes_stream(),
         store,
+        runtime,
         context,
         terminal_recorded: false,
+        _activity: activity,
+        force_cancelled,
     };
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
@@ -165,15 +178,18 @@ impl AttemptContext {
 struct GovernedStream {
     upstream: ProviderByteStream,
     store: SqliteEventStore,
+    runtime: RuntimeState,
     context: AttemptContext,
     terminal_recorded: bool,
+    _activity: RequestActivity,
+    force_cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
 impl GovernedStream {
     fn record(&mut self, event: GovernorEvent) {
         self.terminal_recorded = true;
         let store = self.store.clone();
-        tokio::spawn(async move {
+        self.runtime.spawn_persistence(async move {
             if store.append(&event).await.is_ok() {
                 log_terminal_event(&event, None);
             }
@@ -219,6 +235,13 @@ impl Stream for GovernedStream {
     type Item = Result<Bytes, ProviderError>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.force_cancelled.as_mut().poll(context).is_ready() {
+            if !self.terminal_recorded {
+                let event = self.context.failed(ErrorClass::Cancelled);
+                self.record(event);
+            }
+            return Poll::Ready(None);
+        }
         match self.upstream.as_mut().poll_next(context) {
             Poll::Ready(Some(Ok(ProviderChunk {
                 bytes,
