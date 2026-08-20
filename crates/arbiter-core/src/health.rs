@@ -31,6 +31,7 @@ pub struct DaemonIdentity {
     pub pid: u32,
     pub port: u16,
     pub version: String,
+    #[serde(default)]
     pub instance_id: String,
 }
 

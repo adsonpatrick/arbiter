@@ -89,7 +89,7 @@ impl FileOperations for RealFileOperations {
         private: bool,
     ) -> Result<PreparedMutation, CodexProfileError> {
         let permissions = if private {
-            permissions.private_version()
+            permissions.private_version()?
         } else {
             permissions.clone()
         };

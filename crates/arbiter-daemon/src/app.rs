@@ -219,9 +219,15 @@ async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
 mod tests {
     use std::{future::pending, time::Duration};
 
+    use arbiter_provider_codex::provider::CodexUpstreamProvider;
+    use arbiter_storage_sqlite::SqliteEventStore;
+    use serde_json::json;
+    use tempfile::tempdir;
     use tokio::time::Instant;
 
-    use super::wait_until_deadline;
+    use crate::AppState;
+
+    use super::{serve_listener_with_shutdown, wait_until_deadline};
 
     #[tokio::test]
     async fn shutdown_phases_share_one_deadline() {
@@ -245,5 +251,60 @@ mod tests {
         );
 
         assert!(started.elapsed() < Duration::from_millis(90));
+    }
+
+    #[tokio::test]
+    async fn stalled_http_and_persistence_share_the_process_deadline() {
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let _connection = upstream_listener.accept().await.unwrap();
+            pending::<()>().await;
+        });
+        let provider = CodexUpstreamProvider::new_for_loopback_test(upstream_address).unwrap();
+        let temporary = tempdir().unwrap();
+        let store = SqliteEventStore::open(temporary.path().join("arbiter.db"))
+            .await
+            .unwrap();
+        let state = AppState::new(provider, store.clone());
+        state.runtime.spawn_persistence(pending());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let daemon = tokio::spawn(serve_listener_with_shutdown(
+            state,
+            listener,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            Duration::from_millis(100),
+        ));
+        let request = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("http://{address}/v1/responses"))
+                .header("authorization", "Bearer deadline-test")
+                .json(&json!({"input": "hang before headers"}))
+                .send()
+                .await
+        });
+        for _ in 0..100 {
+            if store.recent_attempt_counts(0).await.unwrap().started == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(store.recent_attempt_counts(0).await.unwrap().started, 1);
+
+        let started = Instant::now();
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(250), daemon)
+            .await
+            .expect("all shutdown phases must fit one deadline")
+            .unwrap()
+            .unwrap();
+
+        assert!(started.elapsed() < Duration::from_millis(170));
+        request.abort();
+        upstream.abort();
     }
 }

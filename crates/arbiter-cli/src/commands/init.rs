@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, bail};
 use arbiter_adapter_codex::{
     ensure_private_dir, harden_private_file, install_profile, uninstall_profile,
+    write_new_private_synced,
 };
 use arbiter_storage_sqlite::SqliteEventStore;
 
@@ -47,6 +48,11 @@ pub(crate) async fn run(
     ensure_private_dir(&paths.arbiter_home).context("create private Arbiter home")?;
     let config = default_config(paths, port, instance_id);
     write_json_atomic(&paths.config, &config).context("write local configuration")?;
+    if paths.database.exists() {
+        harden_private_file(&paths.database).context("protect existing event database")?;
+    } else {
+        write_new_private_synced(&paths.database, b"").context("create private event database")?;
+    }
     let store = SqliteEventStore::open(&paths.database)
         .await
         .context("initialize event database")?;

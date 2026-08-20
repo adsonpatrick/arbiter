@@ -73,6 +73,7 @@ pub(crate) struct LocalConfig {
     pub codex_config: PathBuf,
     pub bind_address: String,
     pub remote_export: bool,
+    #[serde(default)]
     pub instance_id: String,
 }
 
@@ -147,7 +148,6 @@ pub(crate) fn read_config(paths: &Paths) -> anyhow::Result<LocalConfig> {
         || config.bind_address != "127.0.0.1"
         || config.remote_export
         || config.port == 0
-        || config.instance_id.is_empty()
     {
         bail!("local configuration violates the M0 contract");
     }

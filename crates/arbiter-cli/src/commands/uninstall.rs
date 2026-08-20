@@ -55,6 +55,9 @@ fn require_safe_backup_paths(
 
 async fn stop_daemon(paths: &Paths, config: &super::LocalConfig) -> anyhow::Result<()> {
     if !paths.server.exists() {
+        if endpoint_responding(config.port).await {
+            anyhow::bail!("port {} is serving an unrecognized process", config.port);
+        }
         return Ok(());
     }
     let metadata: ServerMetadata = read_json(&paths.server)?;
@@ -87,7 +90,8 @@ mod tests {
     use arbiter_adapter_codex::{InstallReceipt, ManagedFileReceipt, OriginalPermissions};
     use tempfile::tempdir;
 
-    use super::{Paths, require_safe_backup_paths};
+    use super::{Paths, require_safe_backup_paths, stop_daemon};
+    use crate::commands::default_config;
 
     #[test]
     fn rejects_a_receipt_whose_backup_escapes_arbiter_home() {
@@ -122,5 +126,31 @@ mod tests {
         };
 
         assert!(require_safe_backup_paths(&paths, &receipt).is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_an_occupied_configured_port_when_server_metadata_is_missing() {
+        let temporary = tempdir().unwrap();
+        let arbiter_home = temporary.path().join(".arbiter");
+        std::fs::create_dir_all(&arbiter_home).unwrap();
+        let paths = Paths {
+            codex_config: temporary.path().join(".codex/config.toml"),
+            config: arbiter_home.join("config.json"),
+            database: arbiter_home.join("arbiter.db"),
+            receipt: arbiter_home.join("install-receipt.json"),
+            server: arbiter_home.join("server.json"),
+            stop: arbiter_home.join("stop"),
+            arbiter_home,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = default_config(
+            &paths,
+            listener.local_addr().unwrap().port(),
+            "test-instance".to_owned(),
+        );
+
+        let error = stop_daemon(&paths, &config).await.unwrap_err();
+
+        assert!(error.to_string().contains("unrecognized process"));
     }
 }

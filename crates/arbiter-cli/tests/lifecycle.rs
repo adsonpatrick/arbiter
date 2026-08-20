@@ -138,6 +138,78 @@ fn init_without_port_persists_an_ephemeral_port_and_random_instance() {
 }
 
 #[test]
+fn legacy_installation_without_instance_id_can_start_and_uninstall() {
+    let temporary = tempdir().unwrap();
+    let arbiter_home = temporary.path().join(".arbiter");
+    let codex_home = temporary.path().join(".codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let init = arbiter(
+        &arbiter_home,
+        &codex_home,
+        &["init", "codex", "--yes", "--port", &port.to_string()],
+    );
+    assert!(init.status.success());
+    let config_path = arbiter_home.join("config.json");
+    let mut legacy_config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    legacy_config.as_object_mut().unwrap().remove("instance_id");
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&legacy_config).unwrap(),
+    )
+    .unwrap();
+
+    let start = start_arbiter(&arbiter_home, &codex_home);
+    assert!(start.success());
+    let migrated: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    assert!(
+        migrated["instance_id"]
+            .as_str()
+            .is_some_and(|instance_id| !instance_id.is_empty())
+    );
+    assert_running_identity(&arbiter_home, port);
+
+    let uninstall = arbiter(&arbiter_home, &codex_home, &["uninstall", "--yes"]);
+    assert!(
+        uninstall.status.success(),
+        "{}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+}
+
+#[test]
+fn legacy_installation_without_instance_id_can_uninstall_while_stopped() {
+    let temporary = tempdir().unwrap();
+    let arbiter_home = temporary.path().join(".arbiter");
+    let codex_home = temporary.path().join(".codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let init = arbiter(&arbiter_home, &codex_home, &["init", "codex", "--yes"]);
+    assert!(init.status.success());
+    let config_path = arbiter_home.join("config.json");
+    let mut legacy_config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    legacy_config.as_object_mut().unwrap().remove("instance_id");
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&legacy_config).unwrap(),
+    )
+    .unwrap();
+
+    let uninstall = arbiter(&arbiter_home, &codex_home, &["uninstall", "--yes"]);
+
+    assert!(
+        uninstall.status.success(),
+        "{}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    assert!(!arbiter_home.join("install-receipt.json").exists());
+}
+
+#[test]
 fn stale_metadata_plus_generic_health_is_not_accepted_as_arbiter() {
     let temporary = tempdir().unwrap();
     let arbiter_home = temporary.path().join(".arbiter");

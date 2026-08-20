@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OriginalPermissions {
     pub unix_mode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_sddl: Option<String>,
 }
 
 pub(crate) struct PreparedFileReplacement {
@@ -38,28 +40,48 @@ impl OriginalPermissions {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            return Ok(Self {
+            Ok(Self {
                 unix_mode: Some(fs::metadata(path)?.permissions().mode() & 0o777),
-            });
+                windows_sddl: None,
+            })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                unix_mode: None,
+                windows_sddl: Some(windows_acl::capture_dacl(path)?),
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = path;
             Ok(Self::default())
         }
     }
 
-    #[must_use]
-    pub fn private_version(&self) -> Self {
+    /// Returns an owner-only variant while retaining any stricter Unix mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the current Windows user SID cannot be read.
+    pub fn private_version(&self) -> io::Result<Self> {
         #[cfg(unix)]
         {
-            Self {
+            Ok(Self {
                 unix_mode: Some(self.unix_mode.unwrap_or(0o600) & 0o600),
-            }
+                windows_sddl: None,
+            })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            Self::default()
+            Ok(Self {
+                unix_mode: None,
+                windows_sddl: Some(windows_acl::private_sddl()?),
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Ok(Self::default())
         }
     }
 }
@@ -77,6 +99,8 @@ pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
         let mode = fs::metadata(path)?.permissions().mode() & 0o700;
         fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
+    #[cfg(windows)]
+    windows_acl::apply_sddl(path, &windows_acl::private_sddl()?)?;
     Ok(())
 }
 
@@ -117,8 +141,6 @@ pub(crate) fn prepare_atomic_replace_with_permissions(
     bytes: &[u8],
     permissions: &OriginalPermissions,
 ) -> io::Result<PreparedFileReplacement> {
-    #[cfg(not(unix))]
-    let _ = permissions;
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
@@ -133,6 +155,10 @@ pub(crate) fn prepare_atomic_replace_with_permissions(
         temporary
             .as_file()
             .set_permissions(fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(windows)]
+    if let Some(sddl) = &permissions.windows_sddl {
+        windows_acl::apply_sddl(temporary.path(), sddl)?;
     }
     Ok(PreparedFileReplacement {
         temporary,
@@ -150,7 +176,7 @@ pub fn atomic_replace_private(
     bytes: &[u8],
     original_permissions: &OriginalPermissions,
 ) -> io::Result<()> {
-    atomic_replace_with_permissions(path, bytes, &original_permissions.private_version())
+    atomic_replace_with_permissions(path, bytes, &original_permissions.private_version()?)
 }
 
 /// Restricts an existing file's Unix mode to the owning user.
@@ -165,7 +191,129 @@ pub fn harden_private_file(path: &Path) -> io::Result<()> {
         let mode = fs::metadata(path)?.permissions().mode() & 0o600;
         fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    windows_acl::apply_sddl(path, &windows_acl::private_sddl()?)?;
+    #[cfg(not(any(unix, windows)))]
     let _ = path;
     Ok(())
+}
+
+#[cfg(windows)]
+mod windows_acl {
+    use std::{ffi::OsStr, io, path::Path, process::Command};
+
+    fn run(script: &str, environment: &[(&str, &OsStr)]) -> io::Result<String> {
+        let system_root = std::env::var_os("SystemRoot")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SystemRoot is unavailable"))?;
+        let executable = Path::new(&system_root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        let mut command = Command::new(executable);
+        command.env_clear().env("SystemRoot", &system_root);
+        for name in ["WINDIR", "TEMP", "TMP"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ]);
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(io::Error::other("Windows ACL operation failed"));
+        }
+        String::from_utf8(output.stdout)
+            .map(|value| value.trim().to_owned())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    pub(super) fn private_sddl() -> io::Result<String> {
+        let sid = run(
+            "& { [Console]::Out.Write([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) }",
+            &[],
+        )?;
+        if !sid.starts_with("S-")
+            || !sid
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'S' || byte == b'-')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows returned an invalid user SID",
+            ));
+        }
+        Ok(format!("D:P(A;;FA;;;{sid})"))
+    }
+
+    pub(super) fn capture_dacl(path: &Path) -> io::Result<String> {
+        run(
+            "& { [Console]::Out.Write((Get-Acl -LiteralPath $env:ARBITER_ACL_PATH).Sddl) }",
+            &[("ARBITER_ACL_PATH", path.as_os_str())],
+        )
+    }
+
+    pub(super) fn apply_sddl(path: &Path, sddl: &str) -> io::Result<()> {
+        run(
+            "& { $acl = Get-Acl -LiteralPath $env:ARBITER_ACL_PATH; $acl.SetSecurityDescriptorSddlForm($env:ARBITER_ACL_SDDL, [Security.AccessControl.AccessControlSections]::Access); Set-Acl -LiteralPath $env:ARBITER_ACL_PATH -AclObject $acl }",
+            &[
+                ("ARBITER_ACL_PATH", path.as_os_str()),
+                ("ARBITER_ACL_SDDL", OsStr::new(sddl)),
+            ],
+        )
+        .map(|_| ())
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use tempfile::tempdir;
+
+    use super::{
+        OriginalPermissions, atomic_replace_with_permissions, ensure_private_dir,
+        harden_private_file, windows_acl,
+    };
+
+    #[test]
+    fn private_paths_use_a_protected_current_user_dacl() {
+        let temporary = tempdir().unwrap();
+        let private_dir = temporary.path().join("private");
+        ensure_private_dir(&private_dir).unwrap();
+        let file = private_dir.join("secret");
+        std::fs::write(&file, b"secret").unwrap();
+        harden_private_file(&file).unwrap();
+
+        let sid = windows_acl::private_sddl().unwrap();
+        let directory_sddl = windows_acl::capture_dacl(&private_dir).unwrap();
+        let file_sddl = windows_acl::capture_dacl(&file).unwrap();
+
+        assert!(directory_sddl.contains("D:P"));
+        assert!(file_sddl.contains("D:P"));
+        assert!(directory_sddl.contains(&sid[4..]));
+        assert!(file_sddl.contains(&sid[4..]));
+    }
+
+    #[test]
+    fn replacement_restores_the_original_windows_dacl() {
+        let temporary = tempdir().unwrap();
+        let file = temporary.path().join("config.toml");
+        std::fs::write(&file, b"original").unwrap();
+        let original = OriginalPermissions::capture(&file, true).unwrap();
+        harden_private_file(&file).unwrap();
+
+        atomic_replace_with_permissions(&file, b"restored", &original).unwrap();
+
+        assert_eq!(
+            windows_acl::capture_dacl(&file).unwrap(),
+            original.windows_sddl.unwrap()
+        );
+    }
 }

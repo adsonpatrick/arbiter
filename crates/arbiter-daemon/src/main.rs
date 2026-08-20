@@ -6,7 +6,8 @@ use std::{
 use anyhow::Context;
 use arbiter_core::health::DaemonIdentity;
 use arbiter_daemon::{
-    AppState, DEFAULT_SHUTDOWN_GRACE, init_logging, serve_local_with_shutdown, shutdown_signal,
+    AppState, DEFAULT_SHUTDOWN_GRACE, DaemonLease, init_logging, local_bind_address,
+    serve_listener_with_shutdown, shutdown_signal,
 };
 use arbiter_provider_codex::provider::CodexUpstreamProvider;
 use arbiter_storage_sqlite::SqliteEventStore;
@@ -24,6 +25,10 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     init_logging().context("initialize structured logging")?;
+    let listener = tokio::net::TcpListener::bind(local_bind_address(args.port))
+        .await
+        .with_context(|| format!("acquire daemon listener on 127.0.0.1:{}", args.port))?;
+    let _lease = DaemonLease::acquire(&args.database).context("acquire event database lease")?;
     let provider = CodexUpstreamProvider::new().context("initialize Codex upstream provider")?;
     let store = SqliteEventStore::open(&args.database)
         .await
@@ -45,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    serve_local_with_shutdown(
+    serve_listener_with_shutdown(
         AppState::new_with_identity(
             provider,
             store,
@@ -56,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
                 instance_id: uuid::Uuid::new_v4().to_string(),
             },
         ),
-        args.port,
+        listener,
         shutdown_signal(),
         DEFAULT_SHUTDOWN_GRACE,
     )
