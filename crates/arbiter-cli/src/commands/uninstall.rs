@@ -179,7 +179,11 @@ mod tests {
         );
         let metadata = crate::commands::ServerMetadata {
             pid: 1,
-            port: config.port.saturating_add(1),
+            port: if config.port == u16::MAX {
+                config.port - 1
+            } else {
+                config.port + 1
+            },
             version: crate::commands::VERSION.to_owned(),
             instance_id: config.instance_id.clone(),
         };

@@ -22,21 +22,102 @@ impl DaemonLease {
         let mut lock_name = file_name.to_os_string();
         lock_name.push(".lock");
         let path = database.with_file_name(lock_name);
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+        let lock_existed = path.exists();
+        let file = open_file(&path)?;
+        if !lock_existed {
+            protect_file(&file, &path)?;
         }
-        let file = options.open(&path)?;
         fs2::FileExt::try_lock_exclusive(&file)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
+        protect_file(&file, &path)?;
+        drop(open_private(database)?);
         Ok(Self { _file: file })
+    }
+}
+
+fn open_private(path: &Path) -> io::Result<File> {
+    let file = open_file(path)?;
+    protect_file(&file, path)?;
+    Ok(file)
+}
+
+fn open_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn protect_file(_file: &File, path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        _file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(windows)]
+    windows_acl::protect(path)?;
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (_file, path);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+mod windows_acl {
+    use std::{io, path::Path, process::Command};
+
+    fn run(script: &str, path: &Path) -> io::Result<String> {
+        let system_root = std::env::var_os("SystemRoot")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SystemRoot is unavailable"))?;
+        let executable = Path::new(&system_root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        let mut command = Command::new(executable);
+        command
+            .env_clear()
+            .env("SystemRoot", &system_root)
+            .env("ARBITER_SECURE_PATH", path.as_os_str())
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ]);
+        for name in ["WINDIR", "TEMP", "TMP"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(io::Error::other("Windows database ACL operation failed"));
+        }
+        String::from_utf8(output.stdout)
+            .map(|value| value.trim().to_owned())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    pub(super) fn protect(path: &Path) -> io::Result<()> {
+        run(
+            "& { $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $acl = Get-Acl -LiteralPath $env:ARBITER_SECURE_PATH; $acl.SetSecurityDescriptorSddlForm(\"D:P(A;;FA;;;$sid)\", [Security.AccessControl.AccessControlSections]::Access); Set-Acl -LiteralPath $env:ARBITER_SECURE_PATH -AclObject $acl }",
+            path,
+        )
+        .map(|_| ())
+    }
+
+    #[cfg(test)]
+    pub(super) fn capture(path: &Path) -> io::Result<String> {
+        run(
+            "& { [Console]::Out.Write((Get-Acl -LiteralPath $env:ARBITER_SECURE_PATH).Sddl) }",
+            path,
+        )
     }
 }
 
@@ -57,5 +138,37 @@ mod tests {
 
         drop(first);
         assert!(DaemonLease::acquire(&database).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_and_lock_are_created_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempdir().unwrap();
+        let database = temporary.path().join("arbiter.db");
+        let _lease = DaemonLease::acquire(&database).unwrap();
+
+        for path in [&database, &temporary.path().join("arbiter.db.lock")] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn database_and_lock_are_created_with_protected_windows_dacls() {
+        let temporary = tempdir().unwrap();
+        let database = temporary.path().join("arbiter.db");
+        let lock = temporary.path().join("arbiter.db.lock");
+        let _lease = DaemonLease::acquire(&database).unwrap();
+
+        for path in [&database, &lock] {
+            let sddl = super::windows_acl::capture(path).unwrap();
+            assert!(sddl.contains("D:P"));
+            assert!(sddl.contains(";;FA;;;S-"));
+        }
     }
 }

@@ -5,8 +5,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use arbiter_adapter_codex::{
-    OriginalPermissions, atomic_replace_private, ensure_private_dir, harden_private_file,
-    validate_managed_profile,
+    OriginalPermissions, atomic_replace_private, ensure_private_dir, validate_managed_profile,
 };
 use arbiter_daemon::{
     AppState, DEFAULT_SHUTDOWN_GRACE, DaemonLease, local_bind_address,
@@ -71,9 +70,8 @@ async fn run_foreground(paths: &Paths, mut config: super::LocalConfig) -> anyhow
     let listener = tokio::net::TcpListener::bind(local_bind_address(config.port))
         .await
         .with_context(|| format!("acquire daemon listener on 127.0.0.1:{}", config.port))?;
-    harden_private_file(&paths.database).context("protect event database")?;
-    ensure_private_dir(&paths.arbiter_home).context("protect Arbiter home")?;
     let _lease = DaemonLease::acquire(&paths.database).context("acquire event database lease")?;
+    ensure_private_dir(&paths.arbiter_home).context("protect Arbiter home")?;
     if config.instance_id.is_empty() {
         config.instance_id = uuid::Uuid::new_v4().to_string();
         write_json_atomic(&paths.config, &config).context("migrate local daemon identity")?;

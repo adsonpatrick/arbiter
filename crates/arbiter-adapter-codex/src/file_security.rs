@@ -76,7 +76,9 @@ impl OriginalPermissions {
         {
             Ok(Self {
                 unix_mode: None,
-                windows_sddl: Some(windows_acl::private_sddl()?),
+                windows_sddl: Some(windows_acl::private_sddl_no_broader(
+                    self.windows_sddl.as_deref(),
+                )?),
             })
         }
         #[cfg(not(any(unix, windows)))]
@@ -228,6 +230,12 @@ mod windows_acl {
             command.env(name, value);
         }
         let output = command.output()?;
+        if output.status.code() == Some(13) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the original Windows ACL is too restrictive for atomic management",
+            ));
+        }
         if !output.status.success() {
             return Err(io::Error::other("Windows ACL operation failed"));
         }
@@ -252,6 +260,16 @@ mod windows_acl {
             ));
         }
         Ok(format!("D:P(A;;FA;;;{sid})"))
+    }
+
+    pub(super) fn private_sddl_no_broader(original: Option<&str>) -> io::Result<String> {
+        let Some(original) = original else {
+            return private_sddl();
+        };
+        run(
+            "& { $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $applicable = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase); [void]$applicable.Add($identity.User.Value); foreach ($group in $identity.Groups) { [void]$applicable.Add($group.Value) }; $source = [Security.AccessControl.FileSecurity]::new(); $source.SetSecurityDescriptorSddlForm($env:ARBITER_ACL_ORIGINAL); [long]$allowed = 0; [long]$denied = 0; foreach ($rule in $source.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) { if ($applicable.Contains($rule.IdentityReference.Value)) { if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny) { $denied = $denied -bor [long]$rule.FileSystemRights } else { $allowed = $allowed -bor [long]$rule.FileSystemRights } } }; [long]$effective = $allowed -band (-bnot $denied); [long]$required = [long][Security.AccessControl.FileSystemRights]::Modify; if (($effective -band $required) -ne $required) { exit 13 }; $restricted = [Security.AccessControl.FileSecurity]::new(); $restricted.SetAccessRuleProtection($true, $false); if ($denied -ne 0) { $restricted.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity.User, [Security.AccessControl.FileSystemRights]$denied, [Security.AccessControl.AccessControlType]::Deny)) }; $restricted.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity.User, [Security.AccessControl.FileSystemRights]$effective, [Security.AccessControl.AccessControlType]::Allow)); [Console]::Out.Write($restricted.Sddl) }",
+            &[("ARBITER_ACL_ORIGINAL", OsStr::new(original))],
+        )
     }
 
     pub(super) fn capture_dacl(path: &Path) -> io::Result<String> {
@@ -315,5 +333,24 @@ mod windows_tests {
             windows_acl::capture_dacl(&file).unwrap(),
             original.windows_sddl.unwrap()
         );
+    }
+
+    #[test]
+    fn private_replacement_does_not_broaden_a_read_only_owner_dacl() {
+        let temporary = tempdir().unwrap();
+        let file = temporary.path().join("config.toml");
+        std::fs::write(&file, b"original").unwrap();
+        let private = windows_acl::private_sddl().unwrap();
+        let read_only = private.replace(";;FA;;;", ";;FR;;;");
+        windows_acl::apply_sddl(&file, &read_only).unwrap();
+        let original = OriginalPermissions::capture(&file, true).unwrap();
+
+        let error = original.private_version().unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&file).unwrap(), b"original");
+        let unchanged_sddl = windows_acl::capture_dacl(&file).unwrap();
+        assert!(unchanged_sddl.contains(";;FR;;;"));
+        assert!(!unchanged_sddl.contains(";;FA;;;"));
     }
 }
