@@ -45,6 +45,14 @@ call because Codex is agentic.
 | Cancellation | PASS — started attempt has no false completion after client termination |
 | Privacy scan | PASS — synthetic marker absent from SQLite, WAL, and SHM |
 | Restoration | PASS — original config hash restored, named profile removed, daemon stopped |
+| Final live rerun | PASS — 2 ignored tests explicitly executed on parent `21c5471` |
+| Manual smoke | PASS — doctor/start/`m0-ok`/status/uninstall, exit 0 |
+
+Final smoke status reported five attempts, four completed, storage integrity
+`ok`, a healthy daemon, an installed profile, and reachable provider TCP. A
+non-fatal `/v1/models` 404 was expected because M0 exposes only the strict
+Responses surface. The evidence database was preserved under a fresh temporary
+`ARBITER_HOME` while both Codex file hashes were restored exactly.
 
 Do not record authorization values, account headers, prompts, responses, or
 source code in this document.
