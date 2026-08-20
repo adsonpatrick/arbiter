@@ -262,7 +262,7 @@ git commit -m "fix: make Codex profile restoration atomic"
 - Test: `crates/arbiter-storage-sqlite/src/store.rs`
 
 **Interfaces:**
-- Produces: `SqliteEventStore::reconcile_incomplete_attempts(&self, recovered_at_ms: i64) -> Result<u64, StoreError>`.
+- Produces: `SqliteEventStore::reconcile_incomplete_attempts(&self, recovered_at_ms: u64) -> Result<u64, StoreError>`.
 - Produces: `StoreError::DuplicateTerminal { attempt_id: String }` for trigger violations.
 - Consumes: `GovernorEvent::AttemptFailed` with `ErrorClass::StreamInterrupted`.
 
