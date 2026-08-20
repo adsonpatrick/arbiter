@@ -7,6 +7,9 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 use thiserror::Error;
+use tokio::sync::watch;
+
+const CHECKPOINT_IDLE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -32,6 +35,7 @@ impl StoreError {
 #[derive(Debug, Clone)]
 pub struct SqliteEventStore {
     pool: SqlitePool,
+    checkpoint_tx: watch::Sender<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +58,7 @@ impl SqliteEventStore {
             .create_if_missing(true)
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Wal)
+            .pragma("wal_autocheckpoint", "0")
             .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
@@ -62,7 +67,11 @@ impl SqliteEventStore {
 
         sqlx::migrate!("./migrations").run(&pool).await?;
 
-        let store = Self { pool };
+        let checkpoint_tx = spawn_idle_checkpoints(&pool);
+        let store = Self {
+            pool,
+            checkpoint_tx,
+        };
         store.require_integrity().await?;
         Ok(store)
     }
@@ -95,6 +104,7 @@ impl SqliteEventStore {
         .bind(attempt_index)
         .execute(&self.pool)
         .await?;
+        self.checkpoint_tx.send_replace(());
 
         Ok(())
     }
@@ -193,6 +203,40 @@ impl SqliteEventStore {
             Err(StoreError::Integrity(result))
         }
     }
+}
+
+fn spawn_idle_checkpoints(pool: &SqlitePool) -> watch::Sender<()> {
+    let pool = pool.clone();
+    let (checkpoint_tx, mut checkpoint_rx) = watch::channel(());
+    tokio::spawn(async move {
+        'maintenance: loop {
+            tokio::select! {
+                () = pool.close_event() => break 'maintenance,
+                changed = checkpoint_rx.changed() => {
+                    if changed.is_err() {
+                        break 'maintenance;
+                    }
+                }
+            }
+
+            loop {
+                tokio::select! {
+                    () = pool.close_event() => break 'maintenance,
+                    changed = checkpoint_rx.changed() => {
+                        if changed.is_err() {
+                            break 'maintenance;
+                        }
+                    }
+                    () = tokio::time::sleep(CHECKPOINT_IDLE) => break,
+                }
+            }
+
+            let _ = sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
+                .execute(&pool)
+                .await;
+        }
+    });
+    checkpoint_tx
 }
 
 #[cfg(test)]
@@ -301,5 +345,20 @@ mod tests {
                 .expect("read events"),
             vec![started]
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoints_are_kept_off_request_commits() {
+        let temporary = tempdir().expect("temporary directory");
+        let store = SqliteEventStore::open(temporary.path().join("arbiter.db"))
+            .await
+            .expect("open store");
+
+        let auto_checkpoint: i64 = sqlx::query_scalar("PRAGMA wal_autocheckpoint")
+            .fetch_one(&store.pool)
+            .await
+            .expect("read WAL checkpoint policy");
+
+        assert_eq!(auto_checkpoint, 0);
     }
 }

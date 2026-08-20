@@ -135,6 +135,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "arbiter-m0-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arbiter-daemon",
+ "arbiter-provider-codex",
+ "arbiter-storage-sqlite",
+ "axum",
+ "bytes",
+ "clap",
+ "futures-util",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "arbiter-provider-codex"
 version = "0.1.0"
 dependencies = [

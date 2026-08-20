@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "bench",
     "crates/arbiter-adapter-codex",
     "crates/arbiter-cli",
     "crates/arbiter-core",

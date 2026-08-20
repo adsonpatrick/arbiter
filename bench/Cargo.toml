@@ -1,0 +1,28 @@
+[package]
+name = "arbiter-m0-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "proxy-overhead"
+path = "proxy_overhead.rs"
+
+[dependencies]
+anyhow.workspace = true
+arbiter-daemon = { version = "0.1.0", path = "../crates/arbiter-daemon" }
+arbiter-provider-codex = { version = "0.1.0", path = "../crates/arbiter-provider-codex", features = ["test-support"] }
+arbiter-storage-sqlite = { version = "0.1.0", path = "../crates/arbiter-storage-sqlite" }
+axum.workspace = true
+bytes.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
