@@ -108,7 +108,7 @@ async fn codex_profile_streams_through_arbiter_and_cancellation_never_completes(
 
 async fn await_terminal_events(path: &Path) -> Vec<arbiter_core::events::GovernorEvent> {
     let mut events = Vec::new();
-    for _ in 0..100 {
+    for _ in 0..400 {
         let store = SqliteEventStore::open(path)
             .await
             .expect("reopen event store");

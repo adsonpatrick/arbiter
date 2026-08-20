@@ -66,6 +66,8 @@ pub(crate) async fn responses(
         reasoning_effort = "medium",
         "Arbiter attempt event"
     );
+    let mut pending_attempt =
+        PendingAttempt::new(state.store.clone(), state.runtime.clone(), context);
 
     let upstream = match state.provider.forward(&headers, request).await {
         Ok(upstream) => upstream,
@@ -74,13 +76,20 @@ pub(crate) async fn responses(
                 ProviderError::Upstream(_) => ErrorClass::ProviderConnect,
                 _ => ErrorClass::ProviderSetup,
             };
+            let context = pending_attempt.take();
             let failed = context.failed(error_class);
             persist_terminal_with_retry(&state.store, &failed, Some(StatusCode::BAD_GATEWAY)).await;
             return response_with_attempt(StatusCode::BAD_GATEWAY, context.attempt_id);
         }
     };
 
-    proxy_response(upstream, state.store, state.runtime, context, activity)
+    proxy_response(
+        upstream,
+        state.store,
+        state.runtime,
+        pending_attempt.take(),
+        activity,
+    )
 }
 
 fn response_with_attempt(status: StatusCode, attempt_id: AttemptId) -> Response {
@@ -175,6 +184,41 @@ impl AttemptContext {
             duration_ms: failed_at_unix_ms.saturating_sub(self.started_at_unix_ms),
             error_class,
         })
+    }
+}
+
+struct PendingAttempt {
+    store: SqliteEventStore,
+    runtime: RuntimeState,
+    context: Option<AttemptContext>,
+}
+
+impl PendingAttempt {
+    fn new(store: SqliteEventStore, runtime: RuntimeState, context: AttemptContext) -> Self {
+        Self {
+            store,
+            runtime,
+            context: Some(context),
+        }
+    }
+
+    fn take(&mut self) -> AttemptContext {
+        self.context
+            .take()
+            .expect("pending attempt ownership is transferred exactly once")
+    }
+}
+
+impl Drop for PendingAttempt {
+    fn drop(&mut self) {
+        let Some(context) = self.context.take() else {
+            return;
+        };
+        let store = self.store.clone();
+        let failed = context.failed(ErrorClass::Cancelled);
+        self.runtime.spawn_persistence(async move {
+            persist_terminal_with_retry(&store, &failed, None).await;
+        });
     }
 }
 

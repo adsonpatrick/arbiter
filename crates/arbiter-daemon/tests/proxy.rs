@@ -299,6 +299,59 @@ async fn client_cancellation_drops_upstream_and_never_records_completion() {
 }
 
 #[tokio::test]
+async fn client_cancellation_before_upstream_headers_records_cancelled() {
+    let upstream_entered = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::clone(&upstream_entered);
+    let upstream = Router::new().route(
+        "/responses",
+        post(move || {
+            let entered = Arc::clone(&entered);
+            async move {
+                entered.notify_one();
+                std::future::pending::<Response>().await
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider = CodexUpstreamProvider::new_for_loopback_test(listener.local_addr().unwrap())
+        .expect("test provider");
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let temporary = tempdir().unwrap();
+    let store = SqliteEventStore::open(temporary.path().join("arbiter.db"))
+        .await
+        .unwrap();
+    let app = build_router(AppState::new(provider, store.clone()));
+    let request = Request::post("/v1/responses")
+        .header(header::AUTHORIZATION, "Bearer pre-headers-cancellation")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"input": "hello"}).to_string()))
+        .unwrap();
+
+    let request_task = tokio::spawn(async move { app.oneshot(request).await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        upstream_entered.notified(),
+    )
+    .await
+    .expect("request must reach the upstream before cancellation");
+    let started = store.latest_attempt_events().await.unwrap();
+    assert_eq!(started.len(), 1);
+    let attempt_id = started[0].attempt_id();
+
+    request_task.abort();
+    let _ = request_task.await;
+
+    let events = wait_for_events(&store, attempt_id, 2).await;
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        &events[1].kind,
+        GovernorEventKind::AttemptFailed(failed)
+            if failed.error_class == ErrorClass::Cancelled
+    ));
+    server.abort();
+}
+
+#[tokio::test]
 async fn provider_setup_failure_records_started_then_failed() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let provider = CodexUpstreamProvider::new_for_loopback_test(listener.local_addr().unwrap())

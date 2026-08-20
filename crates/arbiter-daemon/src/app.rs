@@ -109,8 +109,11 @@ where
     let mut server = Box::pin(server);
     tokio::pin!(shutdown);
 
-    let (result, deadline) = tokio::select! {
-        result = server.as_mut() => (result, Instant::now() + grace),
+    let (result, deadline, serving_deadline, shutdown_requested, already_forced) = tokio::select! {
+        result = server.as_mut() => {
+            let deadline = Instant::now() + grace;
+            (result, deadline, deadline, false, false)
+        },
         () = &mut shutdown => {
             let deadline = Instant::now() + grace;
             let cleanup_reserve = Duration::from_secs(2).min(grace / 5);
@@ -120,16 +123,32 @@ where
             if let Some(result) =
                 wait_until_deadline(serving_deadline, "graceful_http_drain", server.as_mut()).await
             {
-                (result, deadline)
+                (result, deadline, serving_deadline, true, false)
             } else {
                 state.force_cancel();
                 drop(server);
-                (Ok(()), deadline)
+                (Ok(()), deadline, serving_deadline, true, true)
             }
         }
     };
 
-    let _ = wait_until_deadline(deadline, "active_streams", state.wait_for_idle()).await;
+    let idle_before_cleanup = if shutdown_requested && !already_forced {
+        wait_until_deadline(
+            serving_deadline,
+            "graceful_active_streams",
+            state.wait_for_idle(),
+        )
+        .await
+        .is_some()
+    } else {
+        false
+    };
+    if shutdown_requested && !idle_before_cleanup && !already_forced {
+        state.force_cancel();
+    }
+    if !idle_before_cleanup {
+        let _ = wait_until_deadline(deadline, "active_streams", state.wait_for_idle()).await;
+    }
     let _ = wait_until_deadline(
         deadline,
         "terminal_persistence",
