@@ -1,0 +1,100 @@
+# Arbiter M0 release checklist
+
+Date: 2026-08-20
+Version: `0.1.0`
+Final evidence parent: `900ba6d`
+
+## Decision
+
+**PASS — M0 transparent proxy release gate is closed.** No blocking correctness,
+contract, privacy, restoration, dependency, or performance finding remains.
+
+## Product and contract gates
+
+- [x] Rust workspace builds on stable Rust `1.97.1` / Windows x86_64 MSVC.
+- [x] Codex CLI `0.148.0-alpha.21` uses ChatGPT-managed authentication; Arbiter
+      owns no API key and never reads credential storage.
+- [x] Managed Codex 0.134+ named layer uses `arbiter.config.toml`; no legacy
+      `[profiles.arbiter]` dependency remains.
+- [x] Provider is pinned to the verified HTTPS Codex Responses upstream,
+      disables redirects and semantic retries, and forwards authorization only
+      in memory for the active request.
+- [x] Production target is fixed to `gpt-5.6-terra` with medium reasoning.
+- [x] One provider invocation creates one attempt at index 0; connection errors
+      do not retry, route, or fall back to a stronger model.
+- [x] Direct and through-Arbiter live contract tests pass explicitly.
+- [x] Manual `m0-ok` smoke passes through `--profile arbiter`.
+
+## Runtime gates
+
+- [x] Daemon binds only to `127.0.0.1` and exposes `POST /v1/responses`,
+      `GET /healthz`, and `GET /status`.
+- [x] Default initialization chooses an ephemeral loopback port and random
+      instance ID; lifecycle commands require an exact PID/port/version/instance
+      health identity before trusting a process.
+- [x] Listener ownership and an exclusive database lease precede startup
+      reconciliation; metadata cleanup requires exact identity ownership.
+- [x] Legacy installations without an instance ID can migrate safely on start
+      or uninstall unchanged while stopped.
+- [x] Request fields are preserved except fixed baseline normalization.
+- [x] SSE reaches the client before terminal completion and usage is extracted
+      without changing forwarded bytes.
+- [x] Client cancellation, including cancellation before upstream headers, and
+      interrupted SSE create exactly one typed terminal and cannot create false
+      completion.
+- [x] Pre-attempt storage failure returns 503 and makes zero upstream requests.
+- [x] Provider setup/connect failures produce normalized gateway failure and a
+      durable typed terminal event.
+- [x] Shutdown stops admission and shares one 10-second deadline across HTTP
+      drain, forced cancellation, terminal persistence, and SQLite close.
+
+## Storage, privacy, and lifecycle gates
+
+- [x] SQLite event history is append-only, migration-backed, integrity-checked,
+      WAL-enabled, and survives reopen.
+- [x] The database rejects a second terminal per attempt and startup reconciles
+      incomplete attempts idempotently as interrupted.
+- [x] WAL checkpoint maintenance runs after write idleness instead of in request
+      commits; shutdown still closes/checkpoints the pool.
+- [x] Prompt, response, source, repository path, authorization, cookie, account
+      header, and environment sentinels are absent from logs and SQLite/WAL/SHM.
+- [x] Structured telemetry contains only approved operational metadata.
+- [x] `init` is plan-then-apply, preserves unrelated TOML, and does not change
+      the default Codex profile.
+- [x] Existing named profile files are privately backed up and replaced;
+      Arbiter-owned directories/files are hardened, and two-file mutations
+      compensate on partial failure.
+- [x] Windows uses tested protected current-user DACLs, refuses safely rather
+      than broadening an overly restrictive original ACL, and restores the
+      exact original DACL; Unix creates SQLite at `0600` before SQLx opens it.
+- [x] The database lease creates both SQLite and its lock atomically owner-only
+      on Windows and hardens them on every acquisition, including when the
+      standalone daemon is launched directly.
+- [x] `uninstall` verifies hashes, refuses post-install edits, restores exact
+      prior existence/content state, stops the daemon, and preserves history.
+- [x] Final live run reported `CONFIG_RESTORED=True`,
+      `PROFILE_RESTORED=True`, and uninstall exit 0.
+
+## Performance and engineering gates
+
+- [x] Final release benchmark used 50 warmups and 1,000 paired direct/proxy
+      samples with first-byte forwarding asserted for every response.
+- [x] Added first-byte latency is p50 0.192 ms / p95 1.194 ms / p99 7.627 ms.
+- [x] Added total latency is p50 0.254 ms / p95 1.705 ms / p99 15.056 ms.
+- [x] Both distributions satisfy the 10 / 25 / 50 ms p50/p95/p99 M0 gate.
+- [x] `cargo fmt`, Clippy with `-D warnings`, debug tests, release tests,
+      workspace check, `cargo deny`, and diff validation pass.
+- [x] Debug and release suites each execute 73 passing tests; the 2 live tests
+      also pass when explicitly enabled against the Codex ChatGPT login.
+- [x] Dependency audit reports advisories, bans, licenses, and sources `ok`;
+      duplicate-version warnings are transitive and non-blocking.
+
+## Scope audit
+
+M0 contains no phase detector, risk classifier, candidate/adaptive routing,
+evaluation or promotion engine, Supabase/export path, dashboard, LiteLLM path,
+public provider SDK, or multi-harness implementation. Those remain explicitly
+deferred beyond the transparent proxy milestone.
+
+Supporting evidence: [contract gates](contract-gates.md),
+[performance](performance.md), and [operations](operations.md).

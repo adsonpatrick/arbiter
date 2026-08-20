@@ -1,0 +1,14 @@
+# Keep this user comment.
+profile = "daily"
+model = "user-model"
+
+[model_providers.company]
+name = "Company gateway"
+base_url = "https://llm.example.test/v1"
+wire_api = "responses"
+env_key = "COMPANY_TOKEN"
+
+[profiles.daily]
+model = "daily-model"
+model_provider = "company"
+model_reasoning_effort = "high"

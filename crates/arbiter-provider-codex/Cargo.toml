@@ -1,0 +1,25 @@
+[package]
+name = "arbiter-provider-codex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+arbiter-core = { version = "0.1.0", path = "../arbiter-core" }
+bytes.workspace = true
+futures-util.workspace = true
+http.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
