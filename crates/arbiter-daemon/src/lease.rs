@@ -41,6 +41,8 @@ fn open_private(path: &Path) -> io::Result<File> {
 }
 
 fn open_file(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    windows_acl::create_private(path)?;
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
     #[cfg(unix)]
@@ -112,6 +114,14 @@ mod windows_acl {
         .map(|_| ())
     }
 
+    pub(super) fn create_private(path: &Path) -> io::Result<()> {
+        run(
+            "& { $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $security = [Security.AccessControl.FileSecurity]::new(); $security.SetAccessRuleProtection($true, $false); $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity.User, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow)); $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete; $stream = [IO.FileStream]::new($env:ARBITER_SECURE_PATH, [IO.FileMode]::OpenOrCreate, [Security.AccessControl.FileSystemRights]::FullControl, $share, 1, [IO.FileOptions]::None, $security); $stream.Dispose() }",
+            path,
+        )
+        .map(|_| ())
+    }
+
     #[cfg(test)]
     pub(super) fn capture(path: &Path) -> io::Result<String> {
         run(
@@ -170,5 +180,18 @@ mod tests {
             assert!(sddl.contains("D:P"));
             assert!(sddl.contains(";;FA;;;S-"));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_creation_applies_the_dacl_at_creation_time() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("new-private-file");
+
+        super::windows_acl::create_private(&path).unwrap();
+
+        let sddl = super::windows_acl::capture(&path).unwrap();
+        assert!(sddl.contains("D:P"));
+        assert!(sddl.contains(";;FA;;;S-"));
     }
 }

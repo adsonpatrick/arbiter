@@ -267,7 +267,7 @@ mod windows_acl {
             return private_sddl();
         };
         run(
-            "& { $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $applicable = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase); [void]$applicable.Add($identity.User.Value); foreach ($group in $identity.Groups) { [void]$applicable.Add($group.Value) }; $source = [Security.AccessControl.FileSecurity]::new(); $source.SetSecurityDescriptorSddlForm($env:ARBITER_ACL_ORIGINAL); [long]$allowed = 0; [long]$denied = 0; foreach ($rule in $source.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) { if ($applicable.Contains($rule.IdentityReference.Value)) { if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny) { $denied = $denied -bor [long]$rule.FileSystemRights } else { $allowed = $allowed -bor [long]$rule.FileSystemRights } } }; [long]$effective = $allowed -band (-bnot $denied); [long]$required = [long][Security.AccessControl.FileSystemRights]::Modify; if (($effective -band $required) -ne $required) { exit 13 }; $restricted = [Security.AccessControl.FileSecurity]::new(); $restricted.SetAccessRuleProtection($true, $false); if ($denied -ne 0) { $restricted.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity.User, [Security.AccessControl.FileSystemRights]$denied, [Security.AccessControl.AccessControlType]::Deny)) }; $restricted.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity.User, [Security.AccessControl.FileSystemRights]$effective, [Security.AccessControl.AccessControlType]::Allow)); [Console]::Out.Write($restricted.Sddl) }",
+            "& { $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $applicable = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase); [void]$applicable.Add($identity.User.Value); foreach ($group in $identity.Groups) { [void]$applicable.Add($group.Value) }; $source = [Security.AccessControl.FileSecurity]::new(); $source.SetSecurityDescriptorSddlForm($env:ARBITER_ACL_ORIGINAL); [long]$allowed = 0; [long]$denied = 0; foreach ($rule in $source.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) { if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny) { if ($applicable.Contains($rule.IdentityReference.Value)) { $denied = $denied -bor [long]$rule.FileSystemRights } } elseif ($rule.IdentityReference.Value -eq $identity.User.Value) { $allowed = $allowed -bor [long]$rule.FileSystemRights } }; [long]$effective = $allowed -band (-bnot $denied); [long]$required = [long][Security.AccessControl.FileSystemRights]::Modify; if (($effective -band $required) -ne $required) { exit 13 }; $restricted = [Security.AccessControl.FileSecurity]::new(); $restricted.SetAccessRuleProtection($true, $false); if ($denied -ne 0) { $restricted.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity.User, [Security.AccessControl.FileSystemRights]$denied, [Security.AccessControl.AccessControlType]::Deny)) }; $restricted.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity.User, [Security.AccessControl.FileSystemRights]$effective, [Security.AccessControl.AccessControlType]::Allow)); [Console]::Out.Write($restricted.Sddl) }",
             &[("ARBITER_ACL_ORIGINAL", OsStr::new(original))],
         )
     }
@@ -352,5 +352,22 @@ mod windows_tests {
         let unchanged_sddl = windows_acl::capture_dacl(&file).unwrap();
         assert!(unchanged_sddl.contains(";;FR;;;"));
         assert!(!unchanged_sddl.contains(";;FA;;;"));
+    }
+
+    #[test]
+    fn group_allow_does_not_broaden_restricted_owner_access() {
+        let temporary = tempdir().unwrap();
+        let file = temporary.path().join("config.toml");
+        std::fs::write(&file, b"original").unwrap();
+        let private = windows_acl::private_sddl().unwrap();
+        let restricted_owner_with_group_allow =
+            format!("{}(A;;FA;;;BU)", private.replace(";;FA;;;", ";;FR;;;"));
+        windows_acl::apply_sddl(&file, &restricted_owner_with_group_allow).unwrap();
+        let original = OriginalPermissions::capture(&file, true).unwrap();
+
+        let error = original.private_version().unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&file).unwrap(), b"original");
     }
 }
