@@ -11,6 +11,20 @@ pub struct OriginalPermissions {
     pub unix_mode: Option<u32>,
 }
 
+pub(crate) struct PreparedFileReplacement {
+    temporary: tempfile::NamedTempFile,
+    target: std::path::PathBuf,
+}
+
+impl PreparedFileReplacement {
+    pub(crate) fn persist(self) -> io::Result<()> {
+        self.temporary
+            .persist(self.target)
+            .map(|_| ())
+            .map_err(|error| error.error)
+    }
+}
+
 impl OriginalPermissions {
     /// Captures the portable permission metadata needed for restoration.
     ///
@@ -95,6 +109,14 @@ pub fn atomic_replace_with_permissions(
     bytes: &[u8],
     permissions: &OriginalPermissions,
 ) -> io::Result<()> {
+    prepare_atomic_replace_with_permissions(path, bytes, permissions)?.persist()
+}
+
+pub(crate) fn prepare_atomic_replace_with_permissions(
+    path: &Path,
+    bytes: &[u8],
+    permissions: &OriginalPermissions,
+) -> io::Result<PreparedFileReplacement> {
     #[cfg(not(unix))]
     let _ = permissions;
     let parent = path
@@ -112,8 +134,10 @@ pub fn atomic_replace_with_permissions(
             .as_file()
             .set_permissions(fs::Permissions::from_mode(mode))?;
     }
-    temporary.persist(path).map_err(|error| error.error)?;
-    Ok(())
+    Ok(PreparedFileReplacement {
+        temporary,
+        target: path.to_owned(),
+    })
 }
 
 /// Atomically replaces a file with owner-only permissions, retaining stricter modes.

@@ -11,8 +11,8 @@ use toml_edit::{DocumentMut, Item, Table, value};
 use crate::{
     config_file::sha256,
     file_security::{
-        OriginalPermissions, atomic_replace_private, atomic_replace_with_permissions,
-        ensure_private_dir, write_new_private_synced,
+        OriginalPermissions, PreparedFileReplacement, ensure_private_dir,
+        prepare_atomic_replace_with_permissions, write_new_private_synced,
     },
 };
 
@@ -54,6 +54,60 @@ pub enum CodexProfileError {
     ManagedEntryInvalid,
     #[error("Codex installation receipt does not match the managed paths")]
     ManagedPathMismatch,
+    #[error("Codex file operation failed and compensating rollback also failed")]
+    CompensationFailed {
+        operation: Box<Self>,
+        compensation: Box<Self>,
+    },
+}
+
+trait FileOperations {
+    fn prepare(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        permissions: &OriginalPermissions,
+        private: bool,
+    ) -> Result<PreparedMutation, CodexProfileError>;
+
+    fn apply(&self, mutation: PreparedMutation) -> Result<(), CodexProfileError>;
+}
+
+struct RealFileOperations;
+
+enum PreparedMutation {
+    Replace(PreparedFileReplacement),
+    Remove(PathBuf),
+}
+
+impl FileOperations for RealFileOperations {
+    fn prepare(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        permissions: &OriginalPermissions,
+        private: bool,
+    ) -> Result<PreparedMutation, CodexProfileError> {
+        let permissions = if private {
+            permissions.private_version()
+        } else {
+            permissions.clone()
+        };
+        Ok(PreparedMutation::Replace(
+            prepare_atomic_replace_with_permissions(path, bytes, &permissions)?,
+        ))
+    }
+
+    fn apply(&self, mutation: PreparedMutation) -> Result<(), CodexProfileError> {
+        match mutation {
+            PreparedMutation::Replace(replacement) => replacement.persist().map_err(Into::into),
+            PreparedMutation::Remove(path) => match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            },
+        }
+    }
 }
 
 /// Installs the managed Arbiter provider and named profile without changing defaults.
@@ -66,6 +120,22 @@ pub fn install_profile(
     arbiter_home: &Path,
     port: u16,
     timestamp_unix_ms: u64,
+) -> Result<InstallReceipt, CodexProfileError> {
+    install_profile_with_ops(
+        config_path,
+        arbiter_home,
+        port,
+        timestamp_unix_ms,
+        &RealFileOperations,
+    )
+}
+
+fn install_profile_with_ops(
+    config_path: &Path,
+    arbiter_home: &Path,
+    port: u16,
+    timestamp_unix_ms: u64,
+    operations: &impl FileOperations,
 ) -> Result<InstallReceipt, CodexProfileError> {
     let profile_path = managed_profile_path(config_path)?;
     let (original, original_existed) = read_optional(config_path)?;
@@ -106,19 +176,24 @@ pub fn install_profile(
         profile_original_permissions.clone(),
     )?;
 
-    atomic_replace_private(config_path, &installed, &original_permissions)?;
-    if let Err(error) = atomic_replace_private(
+    let config_install =
+        operations.prepare(config_path, &installed, &original_permissions, true)?;
+    let profile_install = operations.prepare(
         &profile_path,
         &profile_installed,
         &profile_original_permissions,
-    ) {
-        restore_bytes(
+        true,
+    )?;
+    operations.apply(config_install)?;
+    if let Err(operation) = operations.apply(profile_install) {
+        let compensation = restore_bytes_with_ops(
+            operations,
             config_path,
             &original,
             original_existed,
             &original_permissions,
-        )?;
-        return Err(error.into());
+        );
+        return Err(with_compensation(operation, compensation));
     }
 
     Ok(InstallReceipt {
@@ -137,6 +212,14 @@ pub fn uninstall_profile(
     config_path: &Path,
     receipt: &InstallReceipt,
 ) -> Result<(), CodexProfileError> {
+    uninstall_profile_with_ops(config_path, receipt, &RealFileOperations)
+}
+
+fn uninstall_profile_with_ops(
+    config_path: &Path,
+    receipt: &InstallReceipt,
+    operations: &impl FileOperations,
+) -> Result<(), CodexProfileError> {
     let expected_profile_path = managed_profile_path(config_path)?;
     if receipt.config.path != config_path || receipt.profile.path != expected_profile_path {
         return Err(CodexProfileError::ManagedPathMismatch);
@@ -149,18 +232,37 @@ pub fn uninstall_profile(
 
     let config_backup = verified_backup(&receipt.config)?;
     let profile_backup = verified_backup(&receipt.profile)?;
-    restore_bytes(
+    let installed_config = fs::read(&receipt.config.path)?;
+    let installed_config_permissions = OriginalPermissions::capture(&receipt.config.path, true)?;
+    let config_restore = prepare_state(
+        operations,
         &receipt.config.path,
         &config_backup,
         receipt.config.original_existed,
         &receipt.config.original_permissions,
+        false,
     )?;
-    restore_bytes(
+    let profile_restore = prepare_state(
+        operations,
         &receipt.profile.path,
         &profile_backup,
         receipt.profile.original_existed,
         &receipt.profile.original_permissions,
-    )
+        false,
+    )?;
+    operations.apply(config_restore)?;
+    if let Err(operation) = operations.apply(profile_restore) {
+        let compensation = apply_state(
+            operations,
+            &receipt.config.path,
+            &installed_config,
+            true,
+            &installed_config_permissions,
+            false,
+        );
+        return Err(with_compensation(operation, compensation));
+    }
+    Ok(())
 }
 
 /// Verifies that the managed provider and named profile match the M0 contract.
@@ -241,20 +343,53 @@ fn verified_backup(receipt: &ManagedFileReceipt) -> Result<Vec<u8>, CodexProfile
     }
 }
 
-fn restore_bytes(
+fn restore_bytes_with_ops(
+    operations: &impl FileOperations,
     path: &Path,
     bytes: &[u8],
     existed: bool,
     permissions: &OriginalPermissions,
 ) -> Result<(), CodexProfileError> {
+    apply_state(operations, path, bytes, existed, permissions, false)
+}
+
+fn prepare_state(
+    operations: &impl FileOperations,
+    path: &Path,
+    bytes: &[u8],
+    existed: bool,
+    permissions: &OriginalPermissions,
+    private: bool,
+) -> Result<PreparedMutation, CodexProfileError> {
     if existed {
-        atomic_replace_with_permissions(path, bytes, permissions).map_err(Into::into)
+        operations.prepare(path, bytes, permissions, private)
     } else {
-        match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        Ok(PreparedMutation::Remove(path.to_owned()))
+    }
+}
+
+fn apply_state(
+    operations: &impl FileOperations,
+    path: &Path,
+    bytes: &[u8],
+    existed: bool,
+    permissions: &OriginalPermissions,
+    private: bool,
+) -> Result<(), CodexProfileError> {
+    let mutation = prepare_state(operations, path, bytes, existed, permissions, private)?;
+    operations.apply(mutation)
+}
+
+fn with_compensation(
+    operation: CodexProfileError,
+    compensation: Result<(), CodexProfileError>,
+) -> CodexProfileError {
+    match compensation {
+        Ok(()) => operation,
+        Err(compensation) => CodexProfileError::CompensationFailed {
+            operation: Box::new(operation),
+            compensation: Box::new(compensation),
+        },
     }
 }
 
@@ -311,4 +446,124 @@ fn profile_matches(profile: &DocumentMut) -> bool {
     profile["model"].as_str() == Some("gpt-5.6-terra")
         && profile["model_provider"].as_str() == Some("arbiter")
         && profile["model_reasoning_effort"].as_str() == Some("medium")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::Cell, collections::BTreeSet};
+
+    use tempfile::tempdir;
+
+    use super::{
+        CodexProfileError, FileOperations, RealFileOperations, install_profile,
+        install_profile_with_ops, uninstall_profile_with_ops,
+    };
+    use crate::OriginalPermissions;
+
+    struct FailOnMutations {
+        mutations: Cell<usize>,
+        failures: BTreeSet<usize>,
+    }
+
+    impl FailOnMutations {
+        fn new(failures: impl IntoIterator<Item = usize>) -> Self {
+            Self {
+                mutations: Cell::new(0),
+                failures: failures.into_iter().collect(),
+            }
+        }
+
+        fn fail_now(&self) -> Result<(), CodexProfileError> {
+            let mutation = self.mutations.get() + 1;
+            self.mutations.set(mutation);
+            if self.failures.contains(&mutation) {
+                Err(std::io::Error::other(format!("injected mutation {mutation}")).into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl FileOperations for FailOnMutations {
+        fn prepare(
+            &self,
+            path: &Path,
+            bytes: &[u8],
+            permissions: &OriginalPermissions,
+            private: bool,
+        ) -> Result<super::PreparedMutation, CodexProfileError> {
+            RealFileOperations.prepare(path, bytes, permissions, private)
+        }
+
+        fn apply(&self, mutation: super::PreparedMutation) -> Result<(), CodexProfileError> {
+            self.fail_now()?;
+            RealFileOperations.apply(mutation)
+        }
+    }
+
+    use std::path::Path;
+
+    #[test]
+    fn failed_second_install_mutation_restores_both_original_files() {
+        let temporary = tempdir().unwrap();
+        let config = temporary.path().join("codex/config.toml");
+        let profile = temporary.path().join("codex/arbiter.config.toml");
+        let home = temporary.path().join("arbiter");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let original_config = b"model = \"personal\"\n";
+        let original_profile = b"model = \"prior\"\n";
+        std::fs::write(&config, original_config).unwrap();
+        std::fs::write(&profile, original_profile).unwrap();
+
+        let error =
+            install_profile_with_ops(&config, &home, 43_123, 10, &FailOnMutations::new([2]))
+                .unwrap_err();
+
+        assert!(matches!(error, CodexProfileError::Io(_)));
+        assert_eq!(std::fs::read(config).unwrap(), original_config);
+        assert_eq!(std::fs::read(profile).unwrap(), original_profile);
+    }
+
+    #[test]
+    fn failed_second_uninstall_mutation_restores_both_installed_files() {
+        let temporary = tempdir().unwrap();
+        let config = temporary.path().join("codex/config.toml");
+        let profile = temporary.path().join("codex/arbiter.config.toml");
+        let home = temporary.path().join("arbiter");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "model = \"personal\"\n").unwrap();
+        std::fs::write(&profile, "model = \"prior\"\n").unwrap();
+        let receipt = install_profile(&config, &home, 43_123, 11).unwrap();
+        let installed_config = std::fs::read(&config).unwrap();
+        let installed_profile = std::fs::read(&profile).unwrap();
+
+        let error =
+            uninstall_profile_with_ops(&config, &receipt, &FailOnMutations::new([2])).unwrap_err();
+
+        assert!(matches!(error, CodexProfileError::Io(_)));
+        assert_eq!(std::fs::read(config).unwrap(), installed_config);
+        assert_eq!(std::fs::read(profile).unwrap(), installed_profile);
+    }
+
+    #[test]
+    fn compensation_failure_retains_operation_and_compensation_errors() {
+        let temporary = tempdir().unwrap();
+        let config = temporary.path().join("codex/config.toml");
+        let profile = temporary.path().join("codex/arbiter.config.toml");
+        let home = temporary.path().join("arbiter");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "model = \"personal\"\n").unwrap();
+        std::fs::write(&profile, "model = \"prior\"\n").unwrap();
+        let receipt = install_profile(&config, &home, 43_123, 12).unwrap();
+
+        let error = uninstall_profile_with_ops(&config, &receipt, &FailOnMutations::new([2, 3]))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CodexProfileError::CompensationFailed { operation, compensation }
+                if matches!(*operation, CodexProfileError::Io(_))
+                    && matches!(*compensation, CodexProfileError::Io(_))
+        ));
+    }
 }
