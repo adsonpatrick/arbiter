@@ -1,0 +1,1 @@
+//! Arbiter configuration domain types.

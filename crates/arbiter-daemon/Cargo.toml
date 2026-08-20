@@ -1,0 +1,20 @@
+[package]
+name = "arbiter-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arbiter-core = { version = "0.1.0", path = "../arbiter-core" }
+arbiter-provider-openai = { version = "0.1.0", path = "../arbiter-provider-openai" }
+arbiter-storage-sqlite = { version = "0.1.0", path = "../arbiter-storage-sqlite" }
+axum.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

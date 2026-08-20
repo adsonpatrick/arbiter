@@ -1,0 +1,1 @@
+//! Arbiter component health types.

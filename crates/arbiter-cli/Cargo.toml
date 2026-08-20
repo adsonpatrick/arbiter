@@ -1,0 +1,22 @@
+[package]
+name = "arbiter-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "arbiter"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+arbiter-adapter-codex = { version = "0.1.0", path = "../arbiter-adapter-codex" }
+arbiter-core = { version = "0.1.0", path = "../arbiter-core" }
+arbiter-daemon = { version = "0.1.0", path = "../arbiter-daemon" }
+arbiter-storage-sqlite = { version = "0.1.0", path = "../arbiter-storage-sqlite" }
+clap.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
