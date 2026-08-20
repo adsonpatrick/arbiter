@@ -24,9 +24,9 @@ The current Codex contract uses `$CODEX_HOME/arbiter.config.toml` for the named
    the event database.
 
 The suite checks direct Terra/Medium JSONL streaming, Codex-through-Arbiter
-terminal behavior, usage extraction, metadata-only persistence, and cancellation
-without a false completion. One Codex command is not assumed to equal one model
-call because Codex is agentic.
+terminal behavior, usage extraction, metadata-only persistence, and
+cancellation with exactly one durable failed terminal. One Codex command is not
+assumed to equal one model call because Codex is agentic.
 
 ## Evidence record
 
@@ -42,10 +42,10 @@ call because Codex is agentic.
 | Direct live probe | PASS — exit 0, streamed JSONL, expected synthetic terminal behavior |
 | Through-Arbiter live probe | PASS — exit 0, `/v1/responses`, streamed terminal behavior |
 | Usage extraction | PASS — nonzero input/output usage in durable completion metadata |
-| Cancellation | PASS — started attempt has no false completion after client termination |
+| Cancellation | PASS — exactly `AttemptStarted` + `AttemptFailed(Cancelled)` after client termination |
 | Privacy scan | PASS — synthetic marker absent from SQLite, WAL, and SHM |
-| Restoration | PASS — original config hash restored, named profile removed, daemon stopped |
-| Final live rerun | PASS — 2 ignored tests explicitly executed on parent `21c5471` |
+| Restoration | PASS — exact pre-run existence and SHA-256 restored for both Codex files; daemon stopped |
+| Final live rerun | PASS — 2 ignored tests explicitly executed on parent `a9b7b3f` |
 | Manual smoke | PASS — doctor/start/`m0-ok`/status/uninstall, exit 0 |
 
 Final smoke status reported five attempts, four completed, storage integrity

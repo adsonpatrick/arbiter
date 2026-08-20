@@ -2,7 +2,7 @@
 
 Date: 2026-08-20  
 Version: `0.1.0`  
-Final evidence parent: `21c5471`
+Final evidence parent: `a9b7b3f`
 
 ## Decision
 
@@ -29,21 +29,31 @@ contract, privacy, restoration, dependency, or performance finding remains.
 
 - [x] Daemon binds only to `127.0.0.1` and exposes `POST /v1/responses`,
       `GET /healthz`, and `GET /status`.
+- [x] Default initialization chooses an ephemeral loopback port and random
+      instance ID; lifecycle commands require an exact PID/port/version/instance
+      health identity before trusting a process.
+- [x] Listener ownership and an exclusive database lease precede startup
+      reconciliation; metadata cleanup requires exact identity ownership.
+- [x] Legacy installations without an instance ID can migrate safely on start
+      or uninstall unchanged while stopped.
 - [x] Request fields are preserved except fixed baseline normalization.
 - [x] SSE reaches the client before terminal completion and usage is extracted
       without changing forwarded bytes.
-- [x] Client cancellation and interrupted SSE cannot create false completion.
+- [x] Client cancellation, including cancellation before upstream headers, and
+      interrupted SSE create exactly one typed terminal and cannot create false
+      completion.
 - [x] Pre-attempt storage failure returns 503 and makes zero upstream requests.
 - [x] Provider setup/connect failures produce normalized gateway failure and a
       durable typed terminal event.
-- [x] Shutdown stops admission, gives in-flight work a bounded 10-second grace,
-      force-cancels remaining streams, drains terminal persistence, and closes
-      SQLite.
+- [x] Shutdown stops admission and shares one 10-second deadline across HTTP
+      drain, forced cancellation, terminal persistence, and SQLite close.
 
 ## Storage, privacy, and lifecycle gates
 
 - [x] SQLite event history is append-only, migration-backed, integrity-checked,
       WAL-enabled, and survives reopen.
+- [x] The database rejects a second terminal per attempt and startup reconciles
+      incomplete attempts idempotently as interrupted.
 - [x] WAL checkpoint maintenance runs after write idleness instead of in request
       commits; shutdown still closes/checkpoints the pool.
 - [x] Prompt, response, source, repository path, authorization, cookie, account
@@ -51,6 +61,11 @@ contract, privacy, restoration, dependency, or performance finding remains.
 - [x] Structured telemetry contains only approved operational metadata.
 - [x] `init` is plan-then-apply, preserves unrelated TOML, and does not change
       the default Codex profile.
+- [x] Existing named profile files are privately backed up and replaced;
+      Arbiter-owned directories/files are hardened, and two-file mutations
+      compensate on partial failure.
+- [x] Windows uses tested protected current-user DACLs and exact original-DACL
+      restoration; Unix creates SQLite at `0600` before SQLx opens it.
 - [x] `uninstall` verifies hashes, refuses post-install edits, restores exact
       prior existence/content state, stops the daemon, and preserves history.
 - [x] Final live run reported `CONFIG_RESTORED=True`,
@@ -60,8 +75,8 @@ contract, privacy, restoration, dependency, or performance finding remains.
 
 - [x] Final release benchmark used 50 warmups and 1,000 paired direct/proxy
       samples with first-byte forwarding asserted for every response.
-- [x] Added first-byte latency is p50 0.249 ms / p95 1.277 ms / p99 11.915 ms.
-- [x] Added total latency is p50 0.320 ms / p95 1.749 ms / p99 15.393 ms.
+- [x] Added first-byte latency is p50 0.214 ms / p95 1.468 ms / p99 31.636 ms.
+- [x] Added total latency is p50 0.255 ms / p95 1.930 ms / p99 31.874 ms.
 - [x] Both distributions satisfy the 10 / 25 / 50 ms p50/p95/p99 M0 gate.
 - [x] `cargo fmt`, Clippy with `-D warnings`, debug tests, release tests,
       workspace check, `cargo deny`, and diff validation pass.
