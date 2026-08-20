@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 arbiter-core = { version = "0.1.0", path = "../arbiter-core" }
 bytes.workspace = true

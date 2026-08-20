@@ -115,10 +115,16 @@ dependencies = [
  "arbiter-provider-codex",
  "arbiter-storage-sqlite",
  "axum",
+ "bytes",
+ "clap",
+ "futures-util",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

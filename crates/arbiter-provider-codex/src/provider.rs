@@ -13,6 +13,7 @@ use crate::sse::{SseMetadataParser, TerminalResponseMetadata};
 pub const CODEX_UPSTREAM_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ProviderError {
     #[error("failed to build the Codex upstream HTTP client")]
     ClientSetup(#[source] reqwest::Error),
@@ -22,6 +23,9 @@ pub enum ProviderError {
     InvalidRequest,
     #[error("Codex upstream request failed")]
     Upstream(#[source] reqwest::Error),
+    #[cfg(feature = "test-support")]
+    #[error("test upstream must use a loopback address")]
+    NonLoopbackTestEndpoint,
 }
 
 pub struct ProviderChunk {
@@ -82,7 +86,7 @@ impl ProviderResponse {
 
 pub struct CodexUpstreamProvider {
     client: reqwest::Client,
-    endpoint: &'static str,
+    endpoint: String,
 }
 
 impl std::fmt::Debug for CodexUpstreamProvider {
@@ -110,6 +114,27 @@ impl CodexUpstreamProvider {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(ProviderError::ClientSetup)?;
+        Ok(Self {
+            client,
+            endpoint: endpoint.to_owned(),
+        })
+    }
+
+    /// Creates a loopback-only provider for deterministic integration tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for non-loopback addresses or HTTP client setup failure.
+    #[cfg(feature = "test-support")]
+    pub fn new_for_loopback_test(address: std::net::SocketAddr) -> Result<Self, ProviderError> {
+        if !address.ip().is_loopback() {
+            return Err(ProviderError::NonLoopbackTestEndpoint);
+        }
+        let endpoint = format!("http://{address}/responses");
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(ProviderError::ClientSetup)?;
         Ok(Self { client, endpoint })
     }
 
@@ -132,7 +157,7 @@ impl CodexUpstreamProvider {
         let headers = forwarded_request_headers(incoming_headers)?;
         let response = self
             .client
-            .post(self.endpoint)
+            .post(&self.endpoint)
             .headers(headers)
             .json(&request)
             .send()

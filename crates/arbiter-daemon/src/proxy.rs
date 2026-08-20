@@ -1,0 +1,213 @@
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use arbiter_core::{
+    config::BaselineTarget,
+    events::{AttemptCompleted, AttemptFailed, AttemptStarted, ErrorClass, GovernorEvent},
+    ids::{AttemptId, RequestId},
+};
+use arbiter_provider_codex::provider::{
+    ProviderByteStream, ProviderChunk, ProviderError, ProviderResponse,
+};
+use arbiter_storage_sqlite::SqliteEventStore;
+use axum::{
+    Json,
+    body::Body,
+    extract::State,
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+};
+use bytes::Bytes;
+use futures_util::Stream;
+
+use crate::AppState;
+
+pub(crate) async fn responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<serde_json::Value>,
+) -> Response {
+    let context = AttemptContext::new();
+    let started = GovernorEvent::attempt_started(AttemptStarted {
+        request_id: context.request_id,
+        attempt_id: context.attempt_id,
+        attempt_index: 0,
+        target: context.target.clone(),
+        started_at_unix_ms: context.started_at_unix_ms,
+    });
+
+    if state.store.append(&started).await.is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+
+    let upstream = match state.provider.forward(&headers, request).await {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            let error_class = match error {
+                ProviderError::Upstream(_) => ErrorClass::ProviderConnect,
+                _ => ErrorClass::ProviderSetup,
+            };
+            let failed = context.failed(error_class);
+            let _ = state.store.append(&failed).await;
+            return response_with_attempt(StatusCode::BAD_GATEWAY, context.attempt_id);
+        }
+    };
+
+    proxy_response(upstream, state.store, context)
+}
+
+fn response_with_attempt(status: StatusCode, attempt_id: AttemptId) -> Response {
+    let mut response = status.into_response();
+    response.headers_mut().insert(
+        "x-arbiter-attempt-id",
+        HeaderValue::from_str(&attempt_id.to_string())
+            .expect("UUID is always a valid header value"),
+    );
+    response
+}
+
+fn proxy_response(
+    upstream: ProviderResponse,
+    store: SqliteEventStore,
+    context: AttemptContext,
+) -> Response {
+    let status = upstream.status;
+    let mut response_headers = upstream.headers.clone();
+    response_headers.insert(
+        "x-arbiter-attempt-id",
+        HeaderValue::from_str(&context.attempt_id.to_string())
+            .expect("UUID is always a valid header value"),
+    );
+    let stream = GovernedStream {
+        upstream: upstream.bytes_stream(),
+        store,
+        context,
+        terminal_recorded: false,
+    };
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = status;
+    *response.headers_mut() = response_headers;
+    response
+}
+
+#[derive(Clone)]
+struct AttemptContext {
+    request_id: RequestId,
+    attempt_id: AttemptId,
+    target: BaselineTarget,
+    started_at_unix_ms: u64,
+}
+
+impl AttemptContext {
+    fn new() -> Self {
+        Self {
+            request_id: RequestId::new(),
+            attempt_id: AttemptId::new(),
+            target: BaselineTarget::m0(),
+            started_at_unix_ms: now_unix_ms(),
+        }
+    }
+
+    fn completed(
+        &self,
+        metadata: arbiter_provider_codex::sse::TerminalResponseMetadata,
+    ) -> GovernorEvent {
+        let completed_at_unix_ms = now_unix_ms();
+        GovernorEvent::attempt_completed(AttemptCompleted {
+            request_id: self.request_id,
+            attempt_id: self.attempt_id,
+            attempt_index: 0,
+            target: self.target.clone(),
+            started_at_unix_ms: self.started_at_unix_ms,
+            completed_at_unix_ms,
+            duration_ms: completed_at_unix_ms.saturating_sub(self.started_at_unix_ms),
+            usage: metadata.usage,
+            provider_response_id: Some(metadata.response_id),
+        })
+    }
+
+    fn failed(&self, error_class: ErrorClass) -> GovernorEvent {
+        let failed_at_unix_ms = now_unix_ms();
+        GovernorEvent::attempt_failed(AttemptFailed {
+            request_id: self.request_id,
+            attempt_id: self.attempt_id,
+            attempt_index: 0,
+            target: self.target.clone(),
+            started_at_unix_ms: self.started_at_unix_ms,
+            failed_at_unix_ms,
+            duration_ms: failed_at_unix_ms.saturating_sub(self.started_at_unix_ms),
+            error_class,
+        })
+    }
+}
+
+struct GovernedStream {
+    upstream: ProviderByteStream,
+    store: SqliteEventStore,
+    context: AttemptContext,
+    terminal_recorded: bool,
+}
+
+impl GovernedStream {
+    fn record(&mut self, event: GovernorEvent) {
+        self.terminal_recorded = true;
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            let _ = store.append(&event).await;
+        });
+    }
+}
+
+impl Stream for GovernedStream {
+    type Item = Result<Bytes, ProviderError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.upstream.as_mut().poll_next(context) {
+            Poll::Ready(Some(Ok(ProviderChunk {
+                bytes,
+                terminal_metadata,
+            }))) => {
+                if let Some(metadata) = terminal_metadata
+                    && !self.terminal_recorded
+                {
+                    let event = self.context.completed(metadata);
+                    self.record(event);
+                }
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                let event = self.context.failed(ErrorClass::StreamInterrupted);
+                self.record(event);
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                if !self.terminal_recorded {
+                    let event = self.context.failed(ErrorClass::StreamInterrupted);
+                    self.record(event);
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for GovernedStream {
+    fn drop(&mut self) {
+        if !self.terminal_recorded {
+            let event = self.context.failed(ErrorClass::Cancelled);
+            self.record(event);
+        }
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
